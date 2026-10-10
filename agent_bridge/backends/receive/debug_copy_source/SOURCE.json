@@ -1,0 +1,8 @@
+{
+  "source": "https://gist.github.com/acmerfight/0a01249ef72970d07a2603dbb629e80f",
+  "sha256": {
+    "bootstrap_keys.py": "ce8596107df3ca3715c8b63b522bbcc84148207217fade3b642975323c65b31c",
+    "capture_keys.py": "0b0b9f9296bf02219c07537827ed9ce97671611ffeab36572bedb267a7704d65",
+    "LICENSE": "72380798af61d6131287b0dd3c8dc5345535df641002fece3a02d7ef109c5f8e"
+  }
+}

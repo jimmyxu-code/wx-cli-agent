@@ -56,6 +56,12 @@ impl From<ServerRoutingArgs> for ThinClientCliArgs {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Mac-only structured agent bridge (MCP stdio or JSON CLI).
+    #[cfg(target_os = "macos")]
+    Bridge {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Manage encryption keys
     Key {
         #[command(subcommand)]
@@ -326,6 +332,9 @@ enum Commands {
         /// Return up to 20,000 results (overrides --limit)
         #[arg(long)]
         all: bool,
+        /// Scan decoded message bodies instead of the native word index (local only)
+        #[arg(long)]
+        scan: bool,
         /// Output format
         #[arg(long, default_value = "text", value_enum)]
         format: OutputFormat,
@@ -550,6 +559,22 @@ enum KeyAction {
     },
     /// Scan WeChat process memory for pre-derived encryption keys (requires SIP disabled + sudo, no restart needed)
     Scan,
+    /// Scan only an explicitly prepared private debug copy; keep SIP enabled
+    #[cfg(target_os = "macos")]
+    ScanTrial {
+        #[arg(long)]
+        pid: u32,
+        #[arg(long)]
+        trial_app: PathBuf,
+    },
+    /// Validate private captured per-database keys and merge into the local key store
+    #[cfg(target_os = "macos")]
+    ImportCapture {
+        #[arg(long)]
+        capture_file: PathBuf,
+        #[arg(long)]
+        db_root: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -569,6 +594,33 @@ async fn main() {
     let cli = Cli::from_arg_matches(&matches).unwrap();
 
     let result = match cli.command {
+        #[cfg(target_os = "macos")]
+        Commands::Bridge { args } => {
+            let script = std::env::var_os("WX_BRIDGE_SCRIPT")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::current_exe()
+                        .ok()?
+                        .parent()?
+                        .parent()
+                        .map(|root| root.join("wechat_bridge.py"))
+                });
+            let Some(script) = script.filter(|path| path.is_file()) else {
+                eprintln!("Set WX_BRIDGE_SCRIPT to the installed local wechat_bridge.py");
+                std::process::exit(1);
+            };
+            match std::process::Command::new("/usr/bin/python3")
+                .arg(script)
+                .args(args)
+                .status()
+            {
+                Ok(status) => std::process::exit(status.code().unwrap_or(1)),
+                Err(_) => {
+                    eprintln!("Unable to start the local WeChat bridge");
+                    std::process::exit(1);
+                }
+            }
+        }
         Commands::Key { action } => match action {
             KeyAction::Extract { timeout: t } => cmd::key::cmd_key_extract(t).await,
             KeyAction::List => cmd::key::cmd_key_list(),
@@ -577,6 +629,15 @@ async fn main() {
                 cmd::key::cmd_key_set_image(&account, &image_key)
             }
             KeyAction::Scan => cmd::key::cmd_key_scan(),
+            #[cfg(target_os = "macos")]
+            KeyAction::ScanTrial { pid, trial_app } => {
+                cmd::key::cmd_key_scan_trial(pid, &trial_app)
+            }
+            #[cfg(target_os = "macos")]
+            KeyAction::ImportCapture {
+                capture_file,
+                db_root,
+            } => cmd::key::cmd_key_import_capture(&capture_file, &db_root),
         },
         Commands::Media { action } => cmd::media::cmd_media(action),
         Commands::Watch {
@@ -738,6 +799,7 @@ async fn main() {
             limit,
             offset,
             all,
+            scan,
             format,
             server,
         } => cmd::search::cmd_search(
@@ -748,6 +810,7 @@ async fn main() {
             limit,
             offset,
             all,
+            scan,
             format,
             server.into(),
         ),

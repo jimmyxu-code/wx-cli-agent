@@ -1,5 +1,593 @@
 use std::time::Duration;
 
+#[cfg(target_os = "macos")]
+mod trial_guard {
+    use serde_json::Value;
+    use std::{
+        fs,
+        io::Write,
+        os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+        path::{Path, PathBuf},
+        process::{Command, Stdio},
+    };
+    type SafeResult<T> = Result<T, Box<dyn std::error::Error>>;
+
+    fn command(program: &str, args: &[&std::ffi::OsStr]) -> SafeResult<Vec<u8>> {
+        let out = Command::new(program)
+            .args(args)
+            .output()
+            .map_err(|_| "trial_metadata_command_failed")?;
+        if !out.status.success() {
+            return Err("trial_metadata_command_failed".into());
+        }
+        Ok(out.stdout)
+    }
+    fn plist_json(bytes: &[u8]) -> SafeResult<Value> {
+        let mut child = Command::new("/usr/bin/plutil")
+            .args(["-convert", "json", "-o", "-", "--", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|_| "trial_plist_conversion_failed")?;
+        child
+            .stdin
+            .take()
+            .ok_or("trial_plist_conversion_failed")?
+            .write_all(bytes)
+            .map_err(|_| "trial_plist_conversion_failed")?;
+        let output = child
+            .wait_with_output()
+            .map_err(|_| "trial_plist_conversion_failed")?;
+        if !output.status.success() {
+            return Err("trial_plist_conversion_failed".into());
+        }
+        serde_json::from_slice(&output.stdout).map_err(|_| "trial_plist_invalid".into())
+    }
+    pub fn digest(path: &Path) -> SafeResult<String> {
+        let raw = command(
+            "/usr/bin/shasum",
+            &["-a".as_ref(), "256".as_ref(), path.as_os_str()],
+        )?;
+        let hash = std::str::from_utf8(&raw)
+            .ok()
+            .and_then(|s| s.split_whitespace().next())
+            .ok_or("trial_digest_failed")?;
+        if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err("trial_digest_failed".into());
+        }
+        Ok(hash.to_ascii_lowercase())
+    }
+    pub(super) fn private_owned(path: &Path, uid: u32, directory: bool) -> SafeResult<()> {
+        let meta = fs::symlink_metadata(path).map_err(|_| "trial_private_metadata_missing")?;
+        if meta.file_type().is_symlink()
+            || meta.uid() != uid
+            || (meta.mode() & 0o077 != 0)
+            || (directory && !meta.is_dir())
+            || (!directory && !meta.is_file())
+        {
+            return Err("trial_private_metadata_required".into());
+        }
+        Ok(())
+    }
+    fn read_marker(root: &Path, name: &str, uid: u32) -> SafeResult<Value> {
+        let file = root.join(name);
+        private_owned(&file, uid, false)?;
+        let data = fs::read(file).map_err(|_| "trial_marker_unreadable")?;
+        if data.len() > 1024 * 1024 {
+            return Err("trial_marker_too_large".into());
+        }
+        serde_json::from_slice(&data).map_err(|_| "trial_marker_invalid".into())
+    }
+    fn validate_ticket(
+        ticket: &Value,
+        pid: u32,
+        trial_digest: &str,
+        original_digest: &str,
+    ) -> SafeResult<()> {
+        if ticket.get("pid").and_then(Value::as_u64) != Some(pid as u64)
+            || ticket.get("trialExecutableSha256").and_then(Value::as_str) != Some(trial_digest)
+            || ticket
+                .get("originalExecutableSha256")
+                .and_then(Value::as_str)
+                != Some(original_digest)
+        {
+            return Err("trial_ticket_mismatch".into());
+        }
+        Ok(())
+    }
+    #[link(name = "proc")]
+    unsafe extern "C" {
+        fn proc_pidpath(pid: i32, buffer: *mut libc::c_void, buffersize: u32) -> i32;
+    }
+
+    fn process_path(pid: u32) -> SafeResult<PathBuf> {
+        if pid == 0 || pid > i32::MAX as u32 {
+            return Err("trial_pid_invalid".into());
+        }
+        let mut buffer = [0u8; 4096];
+        let n =
+            unsafe { proc_pidpath(pid as i32, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
+        if n <= 0 {
+            return Err("trial_pid_path_unavailable".into());
+        }
+        let path = std::str::from_utf8(buffer.split(|x| *x == 0).next().unwrap_or(&[]))
+            .map_err(|_| "trial_pid_path_invalid")?;
+        PathBuf::from(path)
+            .canonicalize()
+            .map_err(|_| "trial_pid_path_invalid".into())
+    }
+    pub fn validate(pid: u32, app: &Path) -> SafeResult<String> {
+        let uid = unsafe { libc::geteuid() };
+        if uid == 0 || unsafe { libc::getuid() } != uid {
+            return Err("trial_same_user_required".into());
+        }
+        if app.file_name().and_then(|n| n.to_str()) != Some("WeChat-trial.app") {
+            return Err("trial_app_name_required".into());
+        }
+        let meta = fs::symlink_metadata(app).map_err(|_| "trial_app_missing")?;
+        if meta.file_type().is_symlink() || meta.uid() != uid {
+            return Err("trial_app_owner_invalid".into());
+        }
+        let app = app.canonicalize().map_err(|_| "trial_app_missing")?;
+        if app.starts_with("/Applications") || app.starts_with("/System") {
+            return Err("trial_original_app_forbidden".into());
+        }
+        let root = app.parent().ok_or("trial_private_root_missing")?;
+        private_owned(root, uid, true)?;
+        let plan = read_marker(root, "signing-plan.json", uid)?;
+        let integrity = read_marker(root, "original-integrity.json", uid)?;
+        let ticket = read_marker(root, "scan-trial.json", uid)?;
+        let exe = app
+            .join("Contents/MacOS/WeChat")
+            .canonicalize()
+            .map_err(|_| "trial_executable_missing")?;
+        if exe != app.join("Contents/MacOS/WeChat") || process_path(pid)? != exe {
+            return Err("trial_pid_executable_mismatch".into());
+        }
+        let pid_text = pid.to_string();
+        let uid_raw = command(
+            "/bin/ps",
+            &[
+                "-p".as_ref(),
+                pid_text.as_ref(),
+                "-o".as_ref(),
+                "uid=".as_ref(),
+            ],
+        )?;
+        if std::str::from_utf8(&uid_raw)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            != Some(uid)
+        {
+            return Err("trial_process_owner_mismatch".into());
+        }
+        let original = Path::new("/Applications/WeChat.app/Contents/MacOS/WeChat");
+        let original_hash = digest(original)?;
+        if integrity
+            .get("originalExecutableSha256")
+            .and_then(Value::as_str)
+            != Some(original_hash.as_str())
+        {
+            return Err("trial_original_integrity_mismatch".into());
+        }
+        validate_ticket(&ticket, pid, &digest(&exe)?, &original_hash)?;
+        command(
+            "/usr/bin/codesign",
+            &[
+                "--verify".as_ref(),
+                "--deep".as_ref(),
+                "--strict".as_ref(),
+                app.as_os_str(),
+            ],
+        )?;
+        let info = plist_json(
+            &fs::read(app.join("Contents/Info.plist")).map_err(|_| "trial_info_missing")?,
+        )?;
+        if info.get("CFBundleIdentifier").and_then(Value::as_str) != Some("com.tencent.xinWeChat")
+            || info.get("CFBundleExecutable").and_then(Value::as_str) != Some("WeChat")
+        {
+            return Err("trial_bundle_identity_mismatch".into());
+        }
+        let ent_raw = command(
+            "/usr/bin/codesign",
+            &[
+                "-d".as_ref(),
+                "--entitlements".as_ref(),
+                ":-".as_ref(),
+                app.as_os_str(),
+            ],
+        )?;
+        let actual = plist_json(&ent_raw)?;
+        let main = plan
+            .get("signingOrder")
+            .and_then(Value::as_array)
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find(|i| i.get("kind").and_then(Value::as_str) == Some("main"))
+            })
+            .ok_or("trial_signing_plan_main_missing")?;
+        if main.get("target").and_then(Value::as_str) != Some(".")
+            || main.get("binary").and_then(Value::as_str) != Some("Contents/MacOS/WeChat")
+            || main.get("entitlements") != Some(&actual)
+            || actual
+                .get("com.apple.security.get-task-allow")
+                .and_then(Value::as_bool)
+                != Some(true)
+        {
+            return Err("trial_debug_entitlements_mismatch".into());
+        }
+        let sip = command("/usr/bin/csrutil", &["status".as_ref()])?;
+        if !String::from_utf8_lossy(&sip)
+            .to_lowercase()
+            .contains("status: enabled")
+        {
+            return Err("trial_requires_sip_enabled".into());
+        }
+        // Re-check the process after metadata checks before any memory access.
+        if process_path(pid)? != exe {
+            return Err("trial_pid_changed".into());
+        }
+        info.get("CFBundleShortVersionString")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| "trial_version_missing".into())
+    }
+    pub fn save_private(store: &wx_keychain::KeyStore) -> SafeResult<()> {
+        let path = wx_keychain::KeyStore::default_path().map_err(|_| "trial_store_path_failed")?;
+        let parent = path.parent().ok_or("trial_store_path_failed")?;
+        fs::create_dir_all(parent).map_err(|_| "trial_store_directory_failed")?;
+        let uid = unsafe { libc::geteuid() };
+        let meta = fs::symlink_metadata(parent).map_err(|_| "trial_store_directory_failed")?;
+        if meta.file_type().is_symlink() || meta.uid() != uid {
+            return Err("trial_store_owner_invalid".into());
+        }
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+            .map_err(|_| "trial_store_permissions_failed")?;
+        if path.exists() {
+            private_owned(&path, uid, false)?;
+        }
+        let temp = parent.join(format!(".scan-trial-{}.tmp", std::process::id()));
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temp)
+            .map_err(|_| "trial_store_private_temp_failed")?;
+        let result = (|| -> SafeResult<()> {
+            let text =
+                toml::to_string_pretty(store).map_err(|_| "trial_store_serialization_failed")?;
+            file.write_all(text.as_bytes())
+                .map_err(|_| "trial_store_write_failed")?;
+            file.sync_all().map_err(|_| "trial_store_write_failed")?;
+            fs::rename(&temp, path).map_err(|_| "trial_store_commit_failed")?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(temp);
+        }
+        result
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        #[test]
+        fn ticket_binds_pid_and_both_executable_digests() {
+            let valid = serde_json::json!({"pid":42,"trialExecutableSha256":"trial","originalExecutableSha256":"original"});
+            assert!(validate_ticket(&valid, 42, "trial", "original").is_ok());
+            assert!(validate_ticket(&valid, 43, "trial", "original").is_err());
+            assert!(validate_ticket(&valid, 42, "changed", "original").is_err());
+            assert!(validate_ticket(&valid, 42, "trial", "changed").is_err());
+        }
+        #[test]
+        fn markers_reject_symlinks_and_world_readable_files() {
+            let root = tempfile::tempdir().unwrap();
+            let file = root.path().join("marker");
+            fs::write(&file, b"{}").unwrap();
+            fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+            let uid = unsafe { libc::geteuid() };
+            assert!(private_owned(&file, uid, false).is_err());
+            fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+            assert!(private_owned(&file, uid, false).is_ok());
+            let link = root.path().join("link");
+            std::os::unix::fs::symlink(&file, &link).unwrap();
+            assert!(private_owned(&link, uid, false).is_err());
+        }
+        #[test]
+        fn disabled_or_original_application_names_are_rejected_before_attach() {
+            assert!(validate(42, Path::new("/Applications/WeChat.app")).is_err());
+            assert!(validate(42, Path::new("/tmp/WeChat-trial.disabled")).is_err());
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod capture_import {
+    use serde_json::Value;
+    use std::{
+        fs,
+        io::Read,
+        path::{Component, Path, PathBuf},
+    };
+    type SafeResult<T> = Result<T, Box<dyn std::error::Error>>;
+
+    fn scoped_database(root: &Path, relative: &str) -> SafeResult<PathBuf> {
+        let rel = Path::new(relative);
+        if relative.is_empty()
+            || relative.contains('\\')
+            || relative.contains('\0')
+            || !rel.components().all(|c| matches!(c, Component::Normal(_)))
+            || rel.extension().and_then(|e| e.to_str()) != Some("db")
+        {
+            return Err("capture_database_path_invalid".into());
+        }
+        let resolved = root
+            .join(rel)
+            .canonicalize()
+            .map_err(|_| "capture_database_missing")?;
+        if !resolved.starts_with(root) || !resolved.is_file() {
+            return Err("capture_database_outside_account".into());
+        }
+        let uid = unsafe { libc::geteuid() };
+        use std::os::unix::fs::MetadataExt;
+        if fs::metadata(&resolved)
+            .map_err(|_| "capture_database_metadata_failed")?
+            .uid()
+            != uid
+        {
+            return Err("capture_database_owner_mismatch".into());
+        }
+        Ok(resolved)
+    }
+    fn validate_pair(path: &Path, encoded: &str) -> SafeResult<wx_decrypt::EncKeyPair> {
+        let mut key = [0u8; 32];
+        if encoded.len() != 64 || hex::decode_to_slice(encoded, &mut key).is_err() {
+            return Err("capture_key_format_invalid".into());
+        }
+        let salt = wx_decrypt::read_db_salt(path).map_err(|_| "capture_database_salt_failed")?;
+        let params = &wx_decrypt::MACOS_4_1_7_31;
+        let mut first = vec![0u8; params.page_size];
+        fs::File::open(path)
+            .and_then(|mut file| file.read_exact(&mut first))
+            .map_err(|_| "capture_database_header_failed")?;
+        if !wx_decrypt::validate_enc_key(&first, &key, &salt, params) {
+            return Err("capture_database_hmac_failed".into());
+        }
+        Ok(wx_decrypt::EncKeyPair { key, salt })
+    }
+    fn merge_pairs(
+        entry: Option<&wx_keychain::AccountKey>,
+        imported: &[wx_decrypt::EncKeyPair],
+    ) -> SafeResult<Vec<wx_decrypt::EncKeyPair>> {
+        let mut by_salt = std::collections::BTreeMap::new();
+        let mut insert_encoded = |key: &str, salt: &str| -> SafeResult<()> {
+            let mut k = [0u8; 32];
+            let mut s = [0u8; 16];
+            if hex::decode_to_slice(key, &mut k).is_err()
+                || hex::decode_to_slice(salt, &mut s).is_err()
+            {
+                return Err("capture_existing_store_pair_invalid".into());
+            }
+            by_salt.insert(s, k);
+            Ok(())
+        };
+        if let Some(entry) = entry {
+            if let (Some(key), Some(salt)) = (&entry.enc_key, &entry.enc_key_salt) {
+                insert_encoded(key, salt)?;
+            }
+            for pair in &entry.enc_keys {
+                insert_encoded(&pair.enc_key, &pair.salt)?;
+            }
+        }
+        // Only a newly HMAC-validated value can replace the old value for this salt.
+        for pair in imported {
+            by_salt.insert(pair.salt, pair.key);
+        }
+        Ok(by_salt
+            .into_iter()
+            .map(|(salt, key)| wx_decrypt::EncKeyPair { key, salt })
+            .collect())
+    }
+    pub fn run(capture: &Path, db_root: &Path) -> SafeResult<()> {
+        let uid = unsafe { libc::geteuid() };
+        if uid == 0 || unsafe { libc::getuid() } != uid {
+            return Err("capture_same_user_required".into());
+        }
+        super::trial_guard::private_owned(capture, uid, false)?;
+        let metadata = fs::metadata(capture).map_err(|_| "capture_file_unreadable")?;
+        if metadata.len() > 4 * 1024 * 1024 {
+            return Err("capture_file_too_large".into());
+        }
+        let root = db_root
+            .canonicalize()
+            .map_err(|_| "capture_database_root_invalid")?;
+        let accounts =
+            wx_keychain::find_account_dirs().map_err(|_| "capture_account_discovery_failed")?;
+        let candidates: Vec<_> = accounts
+            .iter()
+            .filter(|account| {
+                account
+                    .data_dir
+                    .join("db_storage")
+                    .canonicalize()
+                    .ok()
+                    .as_ref()
+                    == Some(&root)
+            })
+            .collect();
+        if candidates.len() != 1 {
+            return Err("capture_database_root_not_one_local_account".into());
+        }
+        let account = candidates[0];
+        let document: Value =
+            serde_json::from_slice(&fs::read(capture).map_err(|_| "capture_file_unreadable")?)
+                .map_err(|_| "capture_document_invalid")?;
+        let keys = document
+            .get("keys")
+            .and_then(Value::as_object)
+            .ok_or("capture_document_keys_missing")?;
+        if keys.is_empty() || keys.len() > 4096 {
+            return Err("capture_document_keys_count_invalid".into());
+        }
+        let mut imported = Vec::new();
+        // Finish every validation before touching the persistent key store.
+        for (relative, record) in keys {
+            let path = scoped_database(&root, relative)?;
+            let encoded = record
+                .get("enc_key")
+                .and_then(Value::as_str)
+                .ok_or("capture_document_key_missing")?;
+            imported.push(validate_pair(&path, encoded)?);
+        }
+        let mut store =
+            wx_keychain::KeyStore::load_default().map_err(|_| "capture_store_load_failed")?;
+        let merged = merge_pairs(store.get(&account.account_id), &imported)?;
+        store.set_enc_keys(
+            &account.account_id,
+            &merged,
+            "validated-capture",
+            None,
+            Some(account.base_wxid.clone()),
+        );
+        super::trial_guard::save_private(&store)?;
+        println!(
+            "{}",
+            serde_json::json!({"importedValidatedPairs":imported.len(),"matchedAccounts":1,"savedPrivately":true})
+        );
+        Ok(())
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        fn artificial_db(root: &Path) -> PathBuf {
+            let path = root.join("fixture.db");
+            let mut page = vec![0u8; 4096];
+            page[..16].fill(9);
+            page[4032..].copy_from_slice(&hex::decode("1da082b48452348efe17c886460c32e8805bafb69280481d05ebb832bf799127ddbf4a83508c00272d1c778a0d6bf24942236916df60689f4abaa0eff0a17703").unwrap());
+            fs::write(&path, page).unwrap();
+            path
+        }
+        #[test]
+        fn import_requires_real_first_page_hmac() {
+            let root = tempfile::tempdir().unwrap();
+            let path = artificial_db(root.path());
+            assert!(validate_pair(&path, &hex::encode([7u8; 32])).is_ok());
+            assert!(validate_pair(&path, &hex::encode([8u8; 32])).is_err());
+            let mut bytes = fs::read(&path).unwrap();
+            bytes[50] ^= 1;
+            fs::write(&path, bytes).unwrap();
+            assert!(validate_pair(&path, &hex::encode([7u8; 32])).is_err());
+        }
+        #[test]
+        fn import_rejects_traversal_and_external_symlinks() {
+            let root = tempfile::tempdir().unwrap();
+            let outer = tempfile::tempdir().unwrap();
+            let outside = artificial_db(outer.path());
+            std::os::unix::fs::symlink(&outside, root.path().join("link.db")).unwrap();
+            for name in [
+                "../fixture.db",
+                "/tmp/fixture.db",
+                "link.db",
+                "a\\fixture.db",
+            ] {
+                assert!(scoped_database(root.path(), name).is_err());
+            }
+        }
+        #[test]
+        fn merge_preserves_other_database_keys_and_image_material() {
+            let mut store = wx_keychain::KeyStore::default();
+            store.set(
+                "synthetic-account",
+                &hex::encode([1u8; 32]),
+                "test",
+                None,
+                None,
+            );
+            store.set_image_key("synthetic-account", &hex::encode([2u8; 16]));
+            store.set_enc_keys(
+                "synthetic-account",
+                &[wx_decrypt::EncKeyPair {
+                    key: [3; 32],
+                    salt: [4; 16],
+                }],
+                "test",
+                None,
+                None,
+            );
+            let imported = [wx_decrypt::EncKeyPair {
+                key: [7; 32],
+                salt: [9; 16],
+            }];
+            let merged = merge_pairs(store.get("synthetic-account"), &imported).unwrap();
+            assert_eq!(merged.len(), 2);
+            store.set_enc_keys(
+                "synthetic-account",
+                &merged,
+                "validated-capture",
+                None,
+                None,
+            );
+            let entry = store.get("synthetic-account").unwrap();
+            assert_eq!(entry.data_key, hex::encode([1u8; 32]));
+            assert_eq!(entry.image_aes_key, Some(hex::encode([2u8; 16])));
+            assert_eq!(entry.enc_keys.len(), 2);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn cmd_key_import_capture(
+    capture_file: &std::path::Path,
+    db_root: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    capture_import::run(capture_file, db_root)
+}
+
+#[cfg(target_os = "macos")]
+pub fn cmd_key_scan_trial(
+    pid: u32,
+    trial_app: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let version = trial_guard::validate(pid, trial_app)?;
+    let accounts =
+        wx_keychain::find_account_dirs().map_err(|_| "trial_account_discovery_failed")?;
+    if accounts.is_empty() {
+        return Err("trial_no_accounts".into());
+    }
+    let results = wx_keychain::capture_key_mach(pid, &accounts, &wx_decrypt::MACOS_4_1_7_31)
+        .map_err(|error| match error {
+            wx_keychain::KeychainError::TaskForPidFailed { kr, .. } => {
+                format!("trial_attach_denied_kern_return_{kr}")
+            }
+            wx_keychain::KeychainError::NoKeysFound => "trial_no_validated_keys_found".to_owned(),
+            _ => "trial_capture_failed".to_owned(),
+        })?;
+    // Metadata is revalidated before persisting; a replaced or stopped process fails closed.
+    trial_guard::validate(pid, trial_app)?;
+    let mut store = wx_keychain::KeyStore::load_default().map_err(|_| "trial_store_load_failed")?;
+    let mut pairs_count = 0;
+    for result in &results {
+        let wx_decrypt::KeyMaterial::EncKeys(pairs) = &result.key_material else {
+            return Err("trial_key_material_invalid".into());
+        };
+        pairs_count += pairs.len();
+        store.set_enc_keys(
+            &result.matched_account.account_id,
+            pairs,
+            &version,
+            None,
+            Some(result.matched_account.base_wxid.clone()),
+        );
+    }
+    trial_guard::save_private(&store)?;
+    println!(
+        "{}",
+        serde_json::json!({"validatedPairs":pairs_count,"matchedAccounts":results.len(),"savedPrivately":true})
+    );
+    Ok(())
+}
+
 use crate::util::{lookup_or_resolve_nickname, parse_hex_key_32};
 
 pub async fn cmd_key_extract(timeout_secs: u64) -> Result<(), Box<dyn std::error::Error>> {
@@ -76,7 +664,7 @@ pub fn cmd_key_scan() -> Result<(), Box<dyn std::error::Error>> {
     let sip = wx_keychain::check_sip();
     if !sip.passed {
         return Err(format!(
-            "{} — task_for_pid requires SIP disabled. Disable in Recovery Mode: csrutil disable",
+            "{} — original-process scanning is unavailable. Import a locally validated capture with key import-capture; no system protection was changed",
             sip.detail
         )
         .into());

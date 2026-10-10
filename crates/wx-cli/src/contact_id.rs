@@ -29,10 +29,11 @@ impl std::fmt::Display for ContactResolveError {
 /// Precedence:
 /// 1. Unambiguous special identifiers: `wxid_*`, `*@chatroom`, `filehelper`
 /// 2. Exact username match in ContactResolver
-/// 3. Conservative legacy-ID short-circuit for account-like ASCII identifiers
+/// 3. Exact stored session username, including session-only/system accounts
+/// 4. Conservative legacy-ID short-circuit for account-like ASCII identifiers
 ///    (requires digit; prevents fuzzy mis-resolution of bare account IDs)
-/// 4. Fuzzy match via ContactResolver (`find_candidates`)
-/// 5. DB keyword fallback
+/// 5. Fuzzy match via ContactResolver (`find_candidates`)
+/// 6. DB keyword fallback
 ///
 /// When `visibility` is provided and `show_hidden` is false, hidden talkers
 /// are rejected with `ContactResolveError::Hidden` without leaking existence.
@@ -66,6 +67,34 @@ pub fn resolve_contact_id(
             display_name: Some(display.to_string()),
         };
         return check_visibility(resolved, visibility, show_hidden);
+    }
+
+    // Session-only/system accounts may have no contact row. An exact stored
+    // username must resolve before display-name fuzzy matching.
+    let mut offset = 0;
+    loop {
+        let page = db
+            .query_sessions(
+                &wx_db::SessionQuery::new()
+                    .limit(wx_db::MAX_QUERY_LIMIT)
+                    .offset(offset),
+            )
+            .map_err(|e| ContactResolveError::NotFound(format!("db error: {e}")))?;
+        if page.items.iter().any(|session| session.username == contact) {
+            return check_visibility(
+                ResolvedContact {
+                    wxid: contact.to_string(),
+                    display_name: None,
+                },
+                visibility,
+                show_hidden,
+            );
+        }
+        let returned = page.items.len();
+        if returned < wx_db::MAX_QUERY_LIMIT {
+            break;
+        }
+        offset += returned;
     }
 
     // 3. Conservative legacy-ID short-circuit: ASCII alphanumeric + underscore with at least
@@ -361,6 +390,35 @@ mod tests {
     }
 
     #[test]
+    fn session_only_username_precedes_unrelated_fuzzy_contact_and_keeps_visibility() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = create_db_with_contacts(
+            tmp.path(),
+            &[("wxid_other", "", "official-notify friend", "")],
+        );
+        let conn = rusqlite::Connection::open(tmp.path().join("session/session.db")).unwrap();
+        conn.execute(
+            "INSERT INTO SessionTable(username,summary,sort_timestamp) VALUES(?1,'',1)",
+            ["official-notify"],
+        )
+        .unwrap();
+        let resolver = ContactResolver::build(&db).unwrap();
+        let r = resolve_contact_id("official-notify", &resolver, &db, None, false).unwrap();
+        assert_eq!(r.wxid, "official-notify");
+        let visibility = VisibilityIndex::build(&["official-notify".to_string()], &[], &resolver);
+        assert!(
+            resolve_contact_id("official-notify", &resolver, &db, Some(&visibility), false)
+                .is_err()
+        );
+        assert_eq!(
+            resolve_contact_id("official-notify", &resolver, &db, Some(&visibility), true)
+                .unwrap()
+                .wxid,
+            "official-notify"
+        );
+    }
+
+    #[test]
     fn hidden_talker_returns_not_found() {
         let resolver = ContactResolver::empty();
         let db = {
@@ -443,8 +501,8 @@ mod tests {
         session_conn
             .execute_batch(
                 "CREATE TABLE SessionTable (
-                    userName TEXT, summary TEXT, sortTimestamp INTEGER,
-                    lastMsgType INTEGER, lastMsgSender TEXT, lastSenderDisplayName TEXT
+                    username TEXT, summary TEXT, sort_timestamp INTEGER,
+                    last_msg_type INTEGER, last_msg_sender TEXT, last_sender_display_name TEXT
                 );",
             )
             .unwrap();

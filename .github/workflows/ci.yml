@@ -2,14 +2,23 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, agent-read-macos]
   pull_request:
-    branches: [main]
+    branches: [main, agent-read-macos]
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  bridge:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: sh agent_bridge/test.sh
+
   fmt:
     runs-on: macos-latest
     steps:

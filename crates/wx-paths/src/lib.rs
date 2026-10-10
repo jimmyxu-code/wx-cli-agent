@@ -49,6 +49,27 @@ pub enum PathsError {
     NoState,
     #[error("cannot determine log directory")]
     NoLog,
+    #[error("WX_CLI_CACHE_ROOT must be an absolute, non-root path without parent traversal")]
+    InvalidCacheOverride,
+}
+
+fn resolved_cache_root(
+    default: PathBuf,
+    override_value: Option<std::ffi::OsString>,
+) -> Result<PathBuf, PathsError> {
+    let Some(value) = override_value else {
+        return Ok(default);
+    };
+    let path = PathBuf::from(value);
+    if !path.is_absolute()
+        || path.file_name().is_none()
+        || path
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return Err(PathsError::InvalidCacheOverride);
+    }
+    Ok(path)
 }
 
 impl AppPaths {
@@ -62,7 +83,10 @@ impl AppPaths {
         Ok(Self {
             home,
             config_root: dirs.config_root,
-            cache_root: dirs.cache_root,
+            cache_root: resolved_cache_root(
+                dirs.cache_root,
+                std::env::var_os("WX_CLI_CACHE_ROOT"),
+            )?,
             state_root: dirs.state_root,
             logs_root: dirs.logs_root,
             runtime_root_override: None,
@@ -282,6 +306,32 @@ impl AppPaths {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_override_preserves_default_when_absent() {
+        let default = std::env::temp_dir().join("wx-cache-default");
+        assert_eq!(resolved_cache_root(default.clone(), None).unwrap(), default);
+    }
+
+    #[test]
+    fn cache_override_accepts_private_absolute_directory() {
+        let selected = std::env::temp_dir().join("wx-cache-selected");
+        assert_eq!(
+            resolved_cache_root(PathBuf::new(), Some(selected.clone().into_os_string())).unwrap(),
+            selected
+        );
+    }
+
+    #[test]
+    fn cache_override_rejects_relative_root_and_traversal() {
+        for path in [
+            PathBuf::from("relative-cache"),
+            PathBuf::from("/"),
+            std::env::temp_dir().join("cache/../other"),
+        ] {
+            assert!(resolved_cache_root(PathBuf::new(), Some(path.into_os_string())).is_err());
+        }
+    }
 
     #[test]
     fn app_paths_new_returns_sensible_paths() {

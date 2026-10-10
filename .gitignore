@@ -1,2 +1,15 @@
 /target
 .DS_Store
+**/__pycache__/
+**/*.pyc
+**/.state/
+.wechat-local/
+*.db
+*.db-wal
+*.db-shm
+keys.toml
+keys.json
+*.app/
+*.disabled/
+*.dmg
+*.zip

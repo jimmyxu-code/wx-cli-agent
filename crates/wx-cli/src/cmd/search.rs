@@ -23,16 +23,40 @@ pub fn cmd_search(
     limit: usize,
     offset: usize,
     all: bool,
+    scan: bool,
     format: OutputFormat,
     server: ThinClientCliArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let options = ThinClientOptions::resolve_from_process_env(server);
     let effective_limit = effective_limit_all(all, limit);
 
+    if scan {
+        let envelope = load_local_search(
+            keyword,
+            data_dir,
+            account,
+            key,
+            effective_limit,
+            offset,
+            true,
+        )?;
+        return print_search_output(&envelope, format);
+    }
+
     let envelope = try_remote_or_local(
         &options,
         |client| fetch_remote_search(client, keyword, effective_limit, offset),
-        || load_local_search(keyword, data_dir, account, key, effective_limit, offset),
+        || {
+            load_local_search(
+                keyword,
+                data_dir,
+                account,
+                key,
+                effective_limit,
+                offset,
+                false,
+            )
+        },
         "search",
     )?;
     print_search_output(&envelope, format)
@@ -45,6 +69,7 @@ fn load_local_search(
     key: Option<String>,
     effective_limit: usize,
     offset: usize,
+    scan: bool,
 ) -> Result<JsonEnvelope<SearchHit>, Box<dyn std::error::Error>> {
     let acct = AccountContext::resolve(&ResolveParams {
         account: account.as_deref(),
@@ -61,6 +86,18 @@ fn load_local_search(
     let self_wxid = &acct.base_wxid;
 
     let search_start = std::time::Instant::now();
+
+    if scan {
+        return scan_envelope(
+            keyword,
+            &db,
+            &resolver,
+            self_wxid,
+            effective_limit,
+            offset,
+            &search_start,
+        );
+    }
 
     // --- Native FTS search → fallback to scan ---
     let use_fallback = match db.message_fts_path.as_deref() {
@@ -243,16 +280,26 @@ fn scan_envelope(
 
     for session in &all_sessions {
         // BUG FIX: per-session query uses MAX_QUERY_LIMIT (not user limit)
-        let query = wx_db::MessageQuery::for_talker(&session.username)
-            .keyword(keyword)
-            .limit(wx_db::MAX_QUERY_LIMIT);
-
-        let result = db.query_messages(&query)?;
-        total_scanned += result.stats.total_rows;
-        total_skipped += result.stats.skipped;
-        all_shard_warnings.extend(result.shard_warnings);
-        for msg in result.items {
-            all_hits.push((msg, session.username.clone()));
+        let mut message_offset = 0;
+        loop {
+            let query = wx_db::MessageQuery::for_talker(&session.username)
+                .keyword(keyword)
+                .limit(wx_db::MAX_QUERY_LIMIT)
+                .offset(message_offset);
+            let result = db.query_messages(&query)?;
+            if message_offset == 0 {
+                total_scanned += result.stats.total_rows;
+                total_skipped += result.stats.skipped;
+                all_shard_warnings.extend(result.shard_warnings);
+            }
+            let returned = result.items.len();
+            for msg in result.items {
+                all_hits.push((msg, session.username.clone()));
+            }
+            if returned < wx_db::MAX_QUERY_LIMIT {
+                break;
+            }
+            message_offset += returned;
         }
     }
 
@@ -301,4 +348,56 @@ fn scan_envelope(
             shard_warnings: all_shard_warnings,
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn body_scan_finds_numbers_and_reads_past_twenty_thousand_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["message", "contact", "session"] {
+            std::fs::create_dir(dir.path().join(name)).unwrap();
+        }
+        let mut messages =
+            rusqlite::Connection::open(dir.path().join("message/message_0.db")).unwrap();
+        messages
+            .execute_batch(
+                "CREATE TABLE Name2Id(user_name TEXT);
+            INSERT INTO Name2Id VALUES('filehelper');
+            CREATE TABLE Msg_9e20f478899dc29eb19741386f9343c8 (
+                sort_seq INTEGER,server_id INTEGER,local_type INTEGER,real_sender_id INTEGER,
+                create_time INTEGER,message_content TEXT,packed_info_data BLOB,status INTEGER);",
+            )
+            .unwrap();
+        let transaction = messages.transaction().unwrap();
+        for id in 1..=20005 {
+            transaction.execute("INSERT INTO Msg_9e20f478899dc29eb19741386f9343c8 VALUES(?1,?1,1,1,?1,?2,NULL,0)",
+                                rusqlite::params![id,"确认编号 20261010"]).unwrap();
+        }
+        transaction.commit().unwrap();
+        let contacts = rusqlite::Connection::open(dir.path().join("contact/contact.db")).unwrap();
+        wx_db::test_ddl::create_test_contact_table(&contacts);
+        wx_db::test_ddl::create_test_contact_label_table(&contacts);
+        let sessions = rusqlite::Connection::open(dir.path().join("session/session.db")).unwrap();
+        wx_db::test_ddl::create_test_session_table_extended(&sessions);
+        sessions.execute("INSERT INTO SessionTable(username,sort_timestamp,summary) VALUES('filehelper',1,'')",[]).unwrap();
+        let db = wx_db::WechatDb::open(dir.path()).unwrap();
+        let resolver = ContactResolver::build(&db).unwrap();
+        let page = scan_envelope(
+            "20261010",
+            &db,
+            &resolver,
+            "wxid_self",
+            10,
+            20000,
+            &std::time::Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(page.paging.total, 20005);
+        assert_eq!(page.items.len(), 5);
+        assert!(!page.paging.has_more);
+        assert_eq!(page.stats.skipped, 0);
+    }
 }
