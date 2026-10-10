@@ -8,6 +8,15 @@ All notable changes to this project will be documented in this file.
 
 - Accept WeChat 4.1.7 and newer for key extraction instead of maintaining a fixed version-prefix allowlist.
 
+## [0.7.4-agent.1] - 2026-10-10
+
+- Add a macOS read-only JSON CLI and MCP bridge, including local tables, BLOBs, read-only SQL, paged history, media and receive cursors.
+- Resolve exact session-only account identifiers and add decoded-body search with `search --scan`.
+- Validate captured per-database keys against database HMACs before importing them; retain an explicitly opted-in temporary-copy experiment.
+- Add private cache configuration, safe incomplete-read errors, portable build instructions and synthetic Python tests.
+- Test the new flow on WeChat 4.1.13 build 269602, Apple Silicon. Keep SIP and the original signature unchanged in the tested temporary-copy route; temporary-copy security changes are documented.
+- Native personal-account sending is not verified or ready. No account data, keys or WeChat proprietary binaries are distributed.
+
 ## [0.7.4] - 2026-07-22
 
 ### Features

@@ -21,6 +21,8 @@
 
 需要 macOS arm64、Rust stable、Python 3.9+、Xcode Command Line Tools，以及微信已有的本地账号数据。常规读取不需要 GUI 自动化、辅助功能权限或关闭 SIP。
 
+从源码克隆时先构建。已包含 `agent_bridge/bin/wx-cli` 的发行包可跳过构建，直接运行以下诊断和读取命令。
+
 ```sh
 sh agent_bridge/build-agent.sh
 agent_bridge/bin/wx-cli bridge --read-only call wechat_doctor '{}'

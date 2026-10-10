@@ -81,13 +81,14 @@ class ProtocolTests(unittest.TestCase):
             self.assertEqual(error.exception.code, 'cursor_scope_mismatch')
 
     def test_watch_missing_key_does_not_start_monitor(self):
-        with patch.object(bridge, 'run_wx', side_effect=bridge.BridgeError('database_key_missing', 'Missing key')), patch.object(bridge.subprocess, 'Popen') as monitor:
-            with self.assertRaises(bridge.BridgeError):
+        with patch.object(bridge, 'account_args', return_value=['--account', 'fixture']), patch.object(bridge, 'run_wx', side_effect=bridge.BridgeError('database_key_missing', 'Missing key')), patch.object(bridge.subprocess, 'Popen') as monitor:
+            with self.assertRaises(bridge.BridgeError) as caught:
                 bridge.watch_sessions({'seconds': 1})
+            self.assertEqual(caught.exception.code, 'database_key_missing')
             monitor.assert_not_called()
 
     def test_watch_timeout_terminates_and_labels_preview_events(self):
-        with patch.object(bridge, 'run_wx', return_value=[]), patch.object(bridge.subprocess, 'Popen') as monitor:
+        with patch.object(bridge, 'account_args', return_value=['--account', 'fixture']), patch.object(bridge, 'run_wx', return_value=[]), patch.object(bridge.subprocess, 'Popen') as monitor:
             monitor.return_value.communicate.side_effect = [subprocess.TimeoutExpired('watch', 1), ('{"kind":"update"}\n', '')]
             result = bridge.watch_sessions({'seconds': 1})
             monitor.return_value.terminate.assert_called_once()
@@ -98,7 +99,7 @@ class ProtocolTests(unittest.TestCase):
         messages = [{'jsonrpc': '2.0', 'id': 1, 'method': 'initialize'},
                     {'jsonrpc': '2.0', 'method': 'notifications/initialized'},
                     {'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list'}]
-        process = subprocess.run(['/usr/bin/python3', str(ROOT / 'wechat_bridge.py'), 'mcp'],
+        process = subprocess.run([sys.executable, str(ROOT / 'wechat_bridge.py'), 'mcp'],
                                  input='\n'.join(map(json.dumps, messages)) + '\n',
                                  text=True, capture_output=True, check=True)
         responses = [json.loads(line) for line in process.stdout.splitlines()]

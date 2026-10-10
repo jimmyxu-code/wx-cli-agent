@@ -37,6 +37,7 @@ jobs:
         run: |
           mkdir -p release-stage/wx-cli-agent
           cp README.md LICENSE release-stage/wx-cli-agent/
+          cp -R docs release-stage/wx-cli-agent/
           cp -R agent_bridge release-stage/wx-cli-agent/
           mkdir -p release-stage/wx-cli-agent/agent_bridge/bin
           cp target/aarch64-apple-darwin/release/wx-cli release-stage/wx-cli-agent/agent_bridge/bin/
