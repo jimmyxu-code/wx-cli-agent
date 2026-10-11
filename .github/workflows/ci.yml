@@ -10,6 +10,19 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  native-fixtures:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Offline native ABI and Unix socket fixtures
+        working-directory: experimental/native_send/native_413
+        run: |
+          wx_native_fixture_dir="$(mktemp -d)"
+          trap 'rm -rf "$wx_native_fixture_dir"' EXIT
+          xcrun clang++ -std=c++17 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer test_core.cpp -o "$wx_native_fixture_dir/test-core"
+          "$wx_native_fixture_dir/test-core"
+          xcrun clang++ -std=c++17 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer test_rpc_fixture.cpp -o "$wx_native_fixture_dir/test-rpc"
+          WX_NATIVE_RPC_FIXTURE="$wx_native_fixture_dir/test-rpc" python3 test_rpc_client.py
   bridge:
     runs-on: macos-latest
     steps:
