@@ -1,6 +1,8 @@
 """Real local socket with an offline C++ fixture; no WeChat or network send."""
 import os
+import json
 from pathlib import Path
+import select
 import struct
 import subprocess
 import tempfile
@@ -22,12 +24,20 @@ class OfflineRpcTests(unittest.TestCase):
         self.process = subprocess.Popen(arguments, stdout=subprocess.PIPE,
                                         stderr=subprocess.PIPE, text=True)
         self.addCleanup(self.cleanup_process)
-        for _ in range(200):
-            if self.path.exists():
-                break
+        until = time.monotonic() + 3
+        while time.monotonic() < until:
             if self.process.poll() is not None:
                 self.fail('offline fixture exited before socket readiness')
-            time.sleep(.01)
+            readable, _, _ = select.select([self.process.stdout], [], [], .05)
+            if readable:
+                ready = json.loads(self.process.stdout.readline())
+                self.assertTrue(ready['offlineRpcFixtureReady'])
+                self.assertFalse(ready['realWeChatSend'])
+                break
+        else:
+            self.fail('offline fixture readiness timeout')
+        # bind creates the inode before chmod/listen. The fixture announces
+        # readiness only after rpc_start returns; existence alone races setup.
         self.client = Client(self.path)
         self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
 
