@@ -1151,6 +1151,7 @@ fn content_contains_keyword(content: &crate::model::MessageContent, kw_lower: &s
         MessageContent::Text(s) => s.to_lowercase().contains(kw_lower),
         MessageContent::Image { .. } => false,
         MessageContent::Voice => false,
+        MessageContent::VoiceTranscript { text } => text.to_lowercase().contains(kw_lower),
         MessageContent::Video { .. } => false,
         MessageContent::Emoji(s) => s.to_lowercase().contains(kw_lower),
         MessageContent::Location(s) => s.to_lowercase().contains(kw_lower),

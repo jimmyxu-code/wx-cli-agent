@@ -64,6 +64,17 @@ first and pass their exact IDs. Continue with `paging.nextOffset` until
 `has_more=false`; one page is not all history. `search` defaults to literal decoded
 body scanning, which finds numbers/whole phrases omitted by the word index.
 
+Voice text is automatic in history, incremental receive, timeline and SSE message
+batches: read `voiceTranscript.text` when `status=success`, and keep its `source`.
+Saved WeChat `<voicetrans>` text is preferred; missing text is transcribed locally
+with a pinned SenseVoice runtime and cached. Do not ask the agent to run ASR.
+First missing-text use downloads about 205 MB once per Mac; no audio is uploaded
+and no API key is required. `voiceTranscription=wechat` uses saved WeChat text
+only; `off` skips enrichment. `wechat_voice_status` checks installation without
+setup; `wechat_transcribe_voice` retries one exact visible voice using `contact`
+and decimal-string `serverId`. `unavailable` plus an error is a failure, never a
+transcript. Local original audio and macOS arm64 are needed for fallback.
+
 Preserve structured non-text `content`, including quotes/files/voice. Discover
 `wechat_read_media`, database/table/BLOB and read-only SQL tools when needed.
 For files inside merged records, use `wechat_list_merged_attachments` with the

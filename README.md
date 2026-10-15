@@ -59,10 +59,32 @@ MCP 客户端使用 `./wx mcp`。`./wx config` 输出已代入安装位置的 JS
 - 分页聊天、时间范围、类型筛选、跨会话时间线和上下文定位。
 - 原生词索引搜索，以及 `search --scan` 解码消息正文扫描。扫描搜索不依赖微信分词索引，但也只覆盖 CLI 能解码的本地消息。
 - 数据库、表、行、BLOB 分块和只读 SQL；二进制值编码为 JSON 可传输格式。
-- 本地已下载的图片、语音、视频和附件读取。语音处理需另装 FFmpeg。
+- 本地已下载的图片、语音、视频和附件读取；语音在消息读取中自动附带转写文本，媒体依赖按需自动准备。
 - 合并记录中的普通文件可自动从 CDN 分段下载、AES 解密并校验原件大小/MD5；强制重新下载已通过两份真实 PDF 验收。其他媒体类型的远程下载仍需分别支持。
 - 真正的新消息读取和游标重复拉取已验证。游标不保证补捕旧序号的迟到消息、修改或撤回；会话 watch 可合并中间消息。
 - 只读 MCP stdio 和结构化 JSON CLI。SSE 连接测试成功，但尚未验证真实新消息通过 SSE 到达。
+
+
+## 语音消息直接读取文本
+
+普通 `./wx messages CONTACT_ID`、`wechat_read_messages`、增量 `wechat_receive_pull`、时间线和 SSE 消息批次默认自动包含 `voiceTranscript`；智能体无需另行下载音频或运行转写工具。原始语音类型、消息 ID 和分页仍保留，`snippet` 同时包含可读文本。
+
+```json
+{"content":"Voice","voiceTranscript":{"status":"success","text":"明天三点开会","source":"local_sensevoice","cached":true,"audioUploaded":false}}
+```
+
+优先复用微信保存的 `<voicetrans transtext="…">` 文本（`source=wechat`）。微信“能转文字”并不表示每条本地消息都已有可读结果；当前实现不调用未接入的微信原生转写私有接口。没有保存文本时，项目自动使用本机 SenseVoice 转写并缓存（`source=local_sensevoice`），不会把结果冒充微信原文，也不上传音频或要求 ASR API Key。
+
+首次遇到缺少文字的语音时，macOS arm64 自动下载约 205 MB 的固定识别运行时、模型和 FFmpeg，逐项校验 SHA-256；后续所有智能体共用本机模型缓存，无需重复安装。识别支持普通话、英语、粤语、日语、韩语，仍可能出现识别错误。当前自动转写依赖本地可读取的原始语音；音频缺失、识别失败或不支持的环境会明确返回 `status=unavailable`、`text=null` 和错误码，不把占位符当正文。
+
+```sh
+./wx call wechat_voice_status '{}'
+./wx call wechat_transcribe_voice '{"contact":"CONTACT_ID","serverId":"1234567890123456789"}'
+./wx messages CONTACT_ID --voice-transcription wechat  # 只读微信已保存文本，不下载模型
+./wx messages CONTACT_ID --voice-transcription off     # 跳过自动转写
+```
+
+JSON 工具使用相同的 `voiceTranscription=auto|wechat|off` 参数，默认 `auto`。`wechat_transcribe_voice` 用于精确重试或单条读取，64 位 `serverId` 使用十进制字符串；普通消息读取无需先调用它。底层 Rust 在微信已有转写时返回 `content.VoiceTranscript.text`，未转写语音继续兼容原 `"Voice"` 序列化。源码运行时和发行包均包含这项解析支持。
 
 ## 构建和启动
 
@@ -174,7 +196,7 @@ Python 测试使用合成数据库和模拟服务，不读取你的微信账号�
 
 ```sh
 python3 scripts/package-agent.py --binary agent_bridge/bin/wx-cli \
-  --version v0.7.4-agent.4 --output dist/wx-cli-agent-v0.7.4-agent.4-macos-arm64.tar.gz
+  --version v0.7.4-agent.5 --output dist/wx-cli-agent-v0.7.4-agent.5-macos-arm64.tar.gz
 ```
 
 打包器按源码允许列表收集文件，携带显式指定的开源 CLI 二进制，生成 SHA-256 文件；排除 `.state`、本机 MCP 配置、账号数据、密钥、缓存和微信程序。发行包可离线复用随包运行时；首次账号/密钥条件仍由 `status` 检查。若修改 Rust 功能，维护者应先 `./wx setup --build` 并更新固定运行时发布信息，避免源码入口下载旧功能版本。

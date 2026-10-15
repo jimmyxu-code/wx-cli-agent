@@ -5,6 +5,113 @@
 
 use crate::model::*;
 
+/// Read only WeChat's persisted voice transcription, never voice URL/AES fields.
+pub(crate) fn extract_voice_transcript(xml: &str) -> Option<String> {
+    if xml.len() > 1024 * 1024 || xml.contains("<!DOCTYPE") || xml.contains("<!ENTITY") {
+        return None;
+    }
+    let start = xml.find("<voicetrans")? + "<voicetrans".len();
+    let rest = xml.get(start..)?;
+    if !rest.starts_with(|c: char| c.is_ascii_whitespace() || c == '>' || c == '/') {
+        return None;
+    }
+    let mut attributes = rest;
+    while !attributes.is_empty() {
+        attributes = attributes.trim_start();
+        if attributes.starts_with('>') || attributes.starts_with("/>") {
+            break;
+        }
+        let end = attributes.find(|c: char| c.is_ascii_whitespace() || c == '=')?;
+        let name = &attributes[..end];
+        attributes = attributes[end..]
+            .trim_start()
+            .strip_prefix('=')?
+            .trim_start();
+        let quote = attributes.chars().next()?;
+        if quote != '\'' && quote != '"' {
+            return None;
+        }
+        attributes = &attributes[1..];
+        let end = attributes.find(quote)?;
+        if name == "transtext" {
+            return decode_voice_entities(&attributes[..end]);
+        }
+        attributes = &attributes[end + 1..];
+    }
+    let end = rest.find("</voicetrans>")?;
+    extract_tag_text(&rest[..end], "transtext").filter(|text| !text.trim().is_empty())
+}
+
+fn decode_voice_entities(raw: &str) -> Option<String> {
+    let mut output = String::new();
+    let mut remaining = raw;
+    while let Some(start) = remaining.find('&') {
+        output.push_str(&remaining[..start]);
+        let entity = &remaining[start + 1..];
+        let end = entity.find(';')?;
+        let value = &entity[..end];
+        let decoded = match value {
+            "amp" => '&',
+            "lt" => '<',
+            "gt" => '>',
+            "quot" => '"',
+            "apos" => '\'',
+            numeric if numeric.starts_with("#x") => {
+                char::from_u32(u32::from_str_radix(&numeric[2..], 16).ok()?)?
+            }
+            numeric if numeric.starts_with('#') => char::from_u32(numeric[1..].parse().ok()?)?,
+            _ => return None,
+        };
+        output.push(decoded);
+        remaining = &entity[end + 1..];
+    }
+    output.push_str(remaining);
+    (!output.trim().is_empty() && !output.contains('\0')).then_some(output)
+}
+
+#[cfg(test)]
+mod voice_tests {
+    use super::extract_voice_transcript;
+
+    #[test]
+    fn voice_native_text_unescapes_once_and_excludes_media_credentials() {
+        let xml = r#"<msg><voicemsg aeskey="PRIVATE" voiceurl="PRIVATE"/><voicetrans status="2" transtext="明天 &amp;lt; &#x4e09;&#28857; &quot;确认&quot;"/></msg>"#;
+        assert_eq!(
+            extract_voice_transcript(xml).as_deref(),
+            Some("明天 &lt; 三点 \"确认\"")
+        );
+    }
+
+    #[test]
+    fn voice_handles_single_quotes_and_nested_cdata() {
+        assert_eq!(
+            extract_voice_transcript("<msg><voicetrans transtext = 'hello &amp; bye'/></msg>")
+                .as_deref(),
+            Some("hello & bye")
+        );
+        assert_eq!(
+            extract_voice_transcript(
+                "<msg><voicetrans><transtext><![CDATA[下午开会]]></transtext></voicetrans></msg>"
+            )
+            .as_deref(),
+            Some("下午开会")
+        );
+    }
+
+    #[test]
+    fn missing_blank_or_malformed_text_is_not_a_transcript() {
+        for xml in [
+            "<msg><voicemsg/></msg>",
+            "<voicetrans transtext='  '/>",
+            "<voicetransother transtext='bad'/>",
+            "<voicetrans transtext='bad>",
+            "<!DOCTYPE msg><voicetrans transtext='bad'/>",
+        ] {
+            assert_eq!(extract_voice_transcript(xml), None);
+        }
+    }
+}
+
 // --- Helper functions ---
 
 /// Extract the text content of a single XML tag from the given string.

@@ -204,6 +204,7 @@ pub(crate) fn extract_fts_text(content: &MessageContent) -> Option<String> {
         }
         MessageContent::Image { .. } => None,
         MessageContent::Voice => None,
+        MessageContent::VoiceTranscript { text } => Some(text.clone()),
         MessageContent::Video { .. } => None,
         MessageContent::Unknown { raw, .. } => Some(raw.clone()),
     }

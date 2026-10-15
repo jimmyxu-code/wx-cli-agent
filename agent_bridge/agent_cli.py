@@ -120,7 +120,7 @@ def quickstart(task, account=None):
             arguments['itemPath'] = [0]
         commands['download'].append([command, 'call', name, json.dumps(arguments, separators=(',', ':'))])
     notes = {
-        'read': 'Replace NAME/CONTACT_ID with the requested name and exact returned ID. Follow paging.nextOffset for more history.',
+        'read': 'Replace NAME/CONTACT_ID with the requested name and exact returned ID. Follow paging.nextOffset for more history. Voice text is automatic in voiceTranscript; do not transcribe audio separately.',
         'search': 'Replace KEYWORD. Literal body scanning is the default; follow paging.nextOffset for more results.',
         'download': 'Replace CONTACT_ID, parentSortSeq and itemPath with the exact outer message and returned inner item. Inner original IDs are provenance. Success requires originalFileObtained, sizeVerified and md5Verified.',
         'send': 'EXACT_TEXT is a placeholder; this example prepares only. Add --authorized only for an explicit human request for that exact recipient and text. Check status/job; never replay an uncertain submission.',
@@ -178,6 +178,7 @@ def connect(account=None, task='read', register=False):
 def mcp_instructions():
     return ('Use the available WeChat tools directly; a second connection/setup is unnecessary. '
             'Resolve exact IDs with wechat_contacts, then read with wechat_read_messages or search with wechat_search. '
+            'Voice messages include automatic voiceTranscript text/status/source; do not perform agent-side ASR. '
             'For merged files use wechat_list_merged_attachments then wechat_read_merged_attachment '
             '(automatic download) or wechat_download_merged_attachment (fresh download). '
             'If this chat lacks a newer tool, use JSON CLI immediately: ' +
@@ -518,6 +519,8 @@ def parser():
         p.add_argument('--offset', type=int, default=0)
         if name == 'search':
             p.add_argument('--mode', choices=['native', 'scan'], default='scan')
+        if name == 'messages':
+            p.add_argument('--voice-transcription', choices=['auto', 'wechat', 'off'], default='auto')
     p = commands.add_parser('raw', help='Pass through to the underlying Rust CLI')
     p.add_argument('arguments', nargs=argparse.REMAINDER)
     return result
@@ -635,6 +638,7 @@ def main(argv=None):
                 arguments['search'] = args.target
             if args.command == 'messages':
                 arguments['contact'] = args.target
+                arguments['voiceTranscription'] = args.voice_transcription
             if args.command == 'search':
                 arguments.update(keyword=args.target, mode=args.mode)
             output(invoke(value, names[args.command], arguments))

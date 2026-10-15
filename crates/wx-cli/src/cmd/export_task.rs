@@ -350,7 +350,7 @@ pub fn classify(messages: &[EnrichedMessage]) -> Vec<MediaTask> {
                     msg_index: idx,
                 });
             }
-            MessageContent::Voice => {
+            MessageContent::Voice | MessageContent::VoiceTranscript { .. } => {
                 tasks.push(MediaTask::Voice {
                     server_id: em.message.server_id,
                     msg_index: idx,

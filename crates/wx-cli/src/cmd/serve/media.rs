@@ -150,7 +150,7 @@ async fn resolve_media(
                 "image metadata missing for server_id={}",
                 media_request.server_id
             ))),
-            MessageContent::Voice => {
+            MessageContent::Voice | MessageContent::VoiceTranscript { .. } => {
                 let db_paths = {
                     let mut cache_guard = state_for_cache.media_db_paths.lock().map_err(
                         |e: std::sync::PoisonError<_>| ServeError::Internal(e.to_string()),

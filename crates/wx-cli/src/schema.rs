@@ -265,6 +265,7 @@ pub fn format_content(msg: &Message) -> String {
             format!("[image {}]", md5.as_deref().unwrap_or(""))
         }
         wx_db::MessageContent::Voice => "[voice]".into(),
+        wx_db::MessageContent::VoiceTranscript { text } => format!("[voice] {text}"),
         wx_db::MessageContent::Video { md5 } => {
             format!("[video {}]", md5.as_deref().unwrap_or(""))
         }

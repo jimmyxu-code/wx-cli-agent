@@ -60,6 +60,10 @@ def wx_environment():
     if not environment.get('FFMPEG_PATH'):
         candidates=sorted((STATE/'media-runtime/imageio_ffmpeg/binaries').glob('ffmpeg-macos-aarch64-*'))
         if candidates:environment['FFMPEG_PATH']=str(candidates[0])
+        else:
+            from backends.receive import voice_runtime
+            cached = voice_runtime.ROOT / 'bin/ffmpeg'
+            if cached.is_file() and not cached.is_symlink():environment['FFMPEG_PATH']=str(cached)
     return environment
 
 
@@ -186,6 +190,8 @@ def integer_arg(value, field, minimum=0):
 
 
 def paged_query(name, args):
+    if name == 'wechat_read_messages':
+        voice_mode(args)
     count = limit(args.get('limit', 20))
     offset = integer_arg(args.get('offset', 0), 'offset')
     order = args.get('order', 'desc')
@@ -233,7 +239,57 @@ def paged_query(name, args):
     if isinstance(paging,dict):
         returned=paging.get('returned',len(result.get('items',[])))
         paging['nextOffset']=offset+returned if paging.get('has_more') else None
+    if name == 'wechat_read_messages':
+        enrich_voice_messages(result.get('items', []), args)
     return result
+
+
+def voice_mode(args):
+    from backends.receive.voice_transcripts import validate_mode
+    from backends.receive.voice_runtime import VoiceError
+    try:
+        return validate_mode(args.get('voiceTranscription', 'auto'))
+    except VoiceError as error:
+        raise BridgeError(error.code, 'voiceTranscription must be auto, wechat or off.') from None
+
+
+def enrich_voice_messages(messages, args):
+    from backends.receive import voice_transcripts as voice
+    mode = voice_mode(args)
+    if mode == 'off' or not any(isinstance(item, dict) and voice.is_voice(item) for item in messages):
+        return messages
+    account = args.get('account')
+    if account is None:
+        found = accounts()
+        if len(found) != 1:
+            raise BridgeError('account_selection_required', 'Select an exact account alias for voice reading.')
+        account = next(iter(found))
+    def read_audio(contact, server_id, _ffmpeg):
+        return service_read('wechat_read_media', {'contact': contact, 'serverId': server_id, 'account': account, 'format': 'mp3'})
+    return voice.enrich(messages, state=private_state(), account=account, read_audio=read_audio, mode=mode)
+
+
+def transcribe_voice(args):
+    value = args.get('serverId')
+    if isinstance(value, str) and re.fullmatch('[0-9]{1,19}', value):
+        value = int(value)
+    server_id = integer_arg(value, 'serverId', 1)
+    mode = voice_mode(args)
+    found = paged_query('wechat_read_messages', {'contact': text(args.get('contact'), 'contact'),
+        'account': args.get('account'), 'aroundServerId': server_id, 'context': 1, 'limit': 3,
+        'voiceTranscription': 'off'}).get('items', [])
+    exact = [item for item in found if item.get('server_id') == server_id]
+    if len(exact) != 1:
+        raise BridgeError('voice_message_not_found', 'No unique visible message matches this conversation and server ID.')
+    from backends.receive.voice_transcripts import is_voice
+    if not is_voice(exact[0]):
+        raise BridgeError('message_not_voice', 'The selected message is not a voice message.')
+    if mode == 'off':
+        raise BridgeError('voice_transcription_mode_invalid', 'Use auto or wechat for the transcription tool.')
+    enrich_voice_messages(exact, args)
+    message = exact[0]
+    return {'contact': message['talker'], 'serverId': str(server_id), 'sortSeq': message['sort_seq'],
+            **message['voiceTranscript']}
 
 
 def list_files(args):
@@ -277,6 +333,7 @@ def service_read(name,args):
     from backends.receive import local_service as service
     scoped=account_args(args.get('account'))
     if name=='wechat_timeline':
+        voice_mode(args)
         since=integer_arg(args.get('since'),'since');until=integer_arg(args.get('until'),'until')
         if since>until:raise BridgeError('invalid_argument','since must be at or before until.')
         order=args.get('order','desc')
@@ -292,6 +349,7 @@ def service_read(name,args):
         params={'talker':text(args.get('contact'),'contact'),
                 'server_id':integer_arg(args.get('serverId'),'serverId'),'format':fmt}
     else:
+        voice_mode(args)
         seconds=args.get('seconds',10)
         if type(seconds) is not int or not 1<=seconds<=30:
             raise BridgeError('invalid_argument','seconds must be between 1 and 30.')
@@ -299,11 +357,17 @@ def service_read(name,args):
     try:
         config=service.ensure(private_state(),scoped,run_wx_process,write_private)
         if name=='wechat_read_media':return service.media(config,params,private_state())
-        if name=='wechat_read_events':return service.events(config,seconds)
+        if name=='wechat_read_events':
+            result = service.events(config,seconds)
+            for event in result.get('events', []):
+                if isinstance(event, dict) and event.get('type') == 'message':
+                    enrich_voice_messages(event.get('messages', []), args)
+            return result
         result=service.query(config,'timeline',params)
         validate_database_output('',result)
         paging=result.get('paging',{})
         paging['nextOffset']=paging.get('offset',0)+paging.get('returned',0) if paging.get('has_more') else None
+        enrich_voice_messages(result.get('items', []), args)
         return result
     except service.ServiceError as error:
         if name == 'wechat_read_media' and error.code == 'local_service_http_415':
@@ -422,6 +486,11 @@ def call(name, args):
         raise BridgeError('read_only_mode','This server exposes only WeChat reading tools.')
     if NATIVE_SEND_MODE and name not in {t['name'] for t in available_tools()}:
         raise BridgeError('native_send_mode', 'This server exposes database reads and configured native text tools.')
+    if name == 'wechat_voice_status':
+        from backends.receive.voice_runtime import status
+        return status()
+    if name == 'wechat_transcribe_voice':
+        return transcribe_voice(args)
     if name in ('wechat_list_merged_attachments', 'wechat_read_merged_attachment', 'wechat_download_merged_attachment'):
         return merged_attachment(name, args)
     if name == 'wechat_read_media' and (args.get('mergedItemPath') is not None or args.get('mergedDataId') is not None):
@@ -492,6 +561,8 @@ def call(name, args):
                                       'requiresClientCdnRouteCache':True,'requiresGui':False,
                                       'forceDownloadTool':'wechat_download_merged_attachment'},
                 'agentAccess':{'readOnlyMode':READ_ONLY_MODE,'mcp':'stdio','cli':True},
+                'voiceText': {'automaticInHistoryAndReceive': True, 'prefersSavedWeChatText': True,
+                              'fallback': 'local_sensevoice', 'audioUploaded': False},
                 'incrementalReceive': {'backend': 'wx_cli_database', 'newRowVerified': verified.get('newRow', False), 'completeMessageStream': False},
                 'sessionWatch': {'backend': 'wx_cli_database_session_monitor', 'completeMessageStream': False},
                 'personalNativeSend': native_text_status(),
@@ -500,6 +571,7 @@ def call(name, args):
     if name == 'wechat_watch_sessions':
         return watch_sessions(args)
     if name in ('wechat_receive_start', 'wechat_receive_pull'):
+        voice_mode(args)
         from backends.receive.incremental import initialize, pull, ReceiveError
         contact = text(args.get('contact'), 'contact')
         account = args.get('account')
@@ -525,6 +597,8 @@ def call(name, args):
                 result = pull(run_wx, contact, saved['sortSeq'], scoped_args, limit(args.get('limit', 50)))
         except ReceiveError:
             raise BridgeError('receive_query_invalid', 'Incremental receive cannot safely advance its cursor; use a scoped history query.')
+        if name == 'wechat_receive_pull':
+            enrich_voice_messages(result.get('messages', []), {**args, 'account': account})
         token = secrets.token_hex(16)
         write_private(private_state() / ('receive-' + token + '.json'),
                       {'contact': contact, 'account': account, 'sortSeq': result['sortSeq']})
@@ -610,6 +684,8 @@ OFFSET = {'type':'integer','minimum':0,'default':0}
 PAGE = {'account':CONTACT,'limit':LIMIT,'offset':OFFSET}
 ORDER = {'type':'string','enum':['asc','desc'],'default':'desc'}
 SHOW_HIDDEN = {'type':'boolean','default':False}
+VOICE_MODE = {'type':'string','enum':['auto','wechat','off'],'default':'auto',
+              'description':'Voice text: prefer saved WeChat text; auto locally transcribes missing text and caches it. wechat avoids model setup; off skips enrichment.'}
 MERGED_PATH = {'type':'array','minItems':1,'maxItems':9,'items':{'type':'integer','minimum':0,'maximum':2047}}
 MERGED_PARENT = {'account':CONTACT,'contact':CONTACT,'parentSortSeq':{'type':'integer','minimum':1,'maximum':2**63-1},
     'parentServerId':{'oneOf':[{'type':'string','pattern':'^[0-9]{1,19}$'},{'type':'integer','minimum':1,'maximum':2**63-1}]}}
@@ -620,14 +696,16 @@ TOOLS = [
     tool('wechat_capabilities', 'Report backend types and honest readiness boundaries without reading messages.'),
     tool('wechat_sessions', 'Enumerate local conversations with pagination. Follow paging.nextOffset to read every page.', {**PAGE,'order':ORDER,'showHidden':SHOW_HIDDEN}),
     tool('wechat_contacts', 'Read/search all local contacts and groups, with pagination and labels/profile fields.', {**PAGE,'search':CONTACT,'showHidden':SHOW_HIDDEN}),
-    tool('wechat_read_messages', 'Read complete paginated history, including structured non-text messages. Supports time/type filters and context anchors. For all history use asc and follow paging.nextOffset.', {**PAGE,'contact':CONTACT,'order':ORDER,'showHidden':SHOW_HIDDEN,'since':OFFSET,'until':OFFSET,'type':CONTACT,'aroundSortSeq':OFFSET,'aroundServerId':OFFSET,'context':LIMIT}, ['contact']),
+    tool('wechat_read_messages', 'Read complete paginated history. Voice messages automatically include voiceTranscript text/status/source; no agent-side transcription needed. Supports time/type filters and context anchors. Follow paging.nextOffset.', {**PAGE,'contact':CONTACT,'order':ORDER,'showHidden':SHOW_HIDDEN,'since':OFFSET,'until':OFFSET,'type':CONTACT,'aroundSortSeq':OFFSET,'aroundServerId':OFFSET,'context':LIMIT,'voiceTranscription':VOICE_MODE}, ['contact']),
     tool('wechat_search', 'Search across local conversations. Native uses the WeChat word index; scan checks decoded bodies for a literal substring, including numbers omitted by the index. Follow nextOffset for all hits.', {**PAGE,'keyword':CONTACT,'mode':{'type':'string','enum':['native','scan'],'default':'native'}}, ['keyword']),
-    tool('wechat_timeline','Read a time-bounded timeline across all local conversations using the original loopback API. Follow nextOffset for every page.',{**PAGE,'since':OFFSET,'until':OFFSET,'order':ORDER,'showHidden':SHOW_HIDDEN,'type':CONTACT},['since','until']),
+    tool('wechat_timeline','Read a time-bounded timeline across local conversations with automatic voice text. Follow nextOffset for every page.',{**PAGE,'since':OFFSET,'until':OFFSET,'order':ORDER,'showHidden':SHOW_HIDDEN,'type':CONTACT,'voiceTranscription':VOICE_MODE},['since','until']),
+    tool('wechat_voice_status','Check automatic voice-text support and local model installation without reading messages or downloading software.'),
+    tool('wechat_transcribe_voice','Return text for one exact visible voice message. Prefer saved WeChat text; otherwise locally transcribe and cache. Audio never uploaded. serverId accepts a decimal string to preserve 64-bit IDs.',{'account':CONTACT,'contact':CONTACT,'serverId':MERGED_PARENT['parentServerId'],'voiceTranscription':VOICE_MODE},['contact','serverId']),
     tool('wechat_read_media','Read original local media by exact conversation and outer message server ID. Merged-record files require mergedItemPath or mergedDataId; inner original IDs must not be used as independent messages in this group.',{'account':CONTACT,'contact':CONTACT,'serverId':OFFSET,'format':{'type':'string','enum':['ogg','mp3'],'default':'ogg'},'mergedItemPath':MERGED_PATH,'mergedDataId':CONTACT},['contact','serverId']),
     tool('wechat_list_merged_attachments','List safe file metadata within one exact merged record. Choose one parentSortSeq or parentServerId (use decimal strings for 64-bit IDs), optionally filter exact fileNames. No CDN keys/URLs; no claim that file bytes were obtained.',{**MERGED_PARENT,'fileNames':{'type':'array','items':CONTACT,'minItems':1,'maxItems':100}},['contact']),
     tool('wechat_read_merged_attachment','Get an original merged-record file: locate locally, otherwise download and AES-decrypt via the client CDN cache, then verify exact size and MD5. Choose one parentSortSeq/parentServerId and one itemPath/dataId. Set download=false for local-only reads. No GUI clicks or message sends.',{**MERGED_PARENT,'itemPath':MERGED_PATH,'dataId':CONTACT,'download':{'type':'boolean','default':True}},['contact']),
     tool('wechat_download_merged_attachment','Always download a fresh original merged-record file from WeChat CDN, AES-decrypt and verify exact size and MD5. Bypasses all local file copies. Choose one parentSortSeq/parentServerId and one itemPath/dataId. Requires an existing client CDN cache, no GUI or message sends.',{**MERGED_PARENT,'itemPath':MERGED_PATH,'dataId':CONTACT},['contact']),
-    tool('wechat_read_events','Read a bounded interval of original local SSE events, including message batches. Reconnect gaps require history/timeline recovery; no gap-free claim.',{'account':CONTACT,'seconds':{'type':'integer','minimum':1,'maximum':30,'default':10}}),
+    tool('wechat_read_events','Read a bounded interval of original local SSE events with automatic voice text in message batches. Reconnect gaps require history/timeline recovery; no gap-free claim.',{'account':CONTACT,'seconds':{'type':'integer','minimum':1,'maximum':30,'default':10},'voiceTranscription':VOICE_MODE}),
     tool('wechat_databases','List every refreshed local WeChat database, including favorites, SNS, media and business-message stores.',{'account':CONTACT}),
     tool('wechat_database_tables','Inspect tables, columns, keys and schema of a local WeChat database.',{'account':CONTACT,'database':CONTACT},['database']),
     tool('wechat_read_table','Read any local WeChat table with pagination and parameterized equality filters. Binary fields include locators for complete chunked reads.',{**PAGE,'database':CONTACT,'table':CONTACT,'where':{'type':'object'}},['database','table']),
@@ -637,7 +715,7 @@ TOOLS = [
     tool('wechat_read_file','Read any downloaded account file or exported media in chunks. Follow nextOffset to read all bytes.',{'account':CONTACT,'path':{'type':'string'},'offset':OFFSET,'length':{'type':'integer','minimum':1,'maximum':65536,'default':65536}},['path']),
     tool('wechat_watch_sessions', 'Watch database session changes for a bounded interval. Requires a key; latest previews are not a complete new-message stream.', {'account': CONTACT, 'seconds': {'type': 'integer', 'minimum': 1, 'maximum': 30, 'default': 10}}),
     tool('wechat_receive_start', 'Create a database message cursor from now for one conversation. Requires a validated key; does not read old messages as new.', {'contact': CONTACT, 'account': CONTACT}, ['contact']),
-    tool('wechat_receive_pull', 'Pull actual database message rows after a bound cursor. Save returned cursor only after consuming the batch; not guaranteed for late lower-sequence inserts.', {'contact': CONTACT, 'account': CONTACT, 'cursor': {'type': 'string'}, 'limit': LIMIT}, ['contact', 'cursor']),
+    tool('wechat_receive_pull', 'Pull actual database messages with automatic voiceTranscript text/status/source. Save returned cursor only after consuming the batch; not guaranteed for late lower-sequence inserts.', {'contact': CONTACT, 'account': CONTACT, 'cursor': {'type': 'string'}, 'limit': LIMIT, 'voiceTranscription':VOICE_MODE}, ['contact', 'cursor']),
     tool('wechat_native_sender_status', 'Check native sender configuration/build/login prerequisites without sending or launching WeChat. Optional probe only applies to a configured HTTP adapter.', {'probe': {'type': 'boolean', 'default': False}}),
     tool('wechat_prepare_native_text', 'Prepare exact File Helper text as private JSON, without launching WeChat or sending.', {'recipientId': {'type': 'string', 'enum': ['filehelper']}, 'message': {'type': 'string', 'minLength': 1, 'maxLength': 16384}}, ['recipientId', 'message'], False),
     tool('wechat_submit_native_text', 'Submit a prepared text once. userAuthorized attests an explicit human request for the exact recipient/text. Returns a job, not delivery. Requires compatible native setup, original WeChat quit, and temporary-client login. Never replay uncertainty.', {'draftId': {'type': 'string', 'pattern': '^[0-9a-f]{32}$'}, 'userAuthorized': {'type': 'boolean', 'const': True}}, ['draftId', 'userAuthorized'], False),

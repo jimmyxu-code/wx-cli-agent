@@ -36,3 +36,7 @@ python3 agent_bridge/backends/receive/debug_copy_source/bootstrap_keys.py --help
 独立原生后端已在 4.1.13/build 269602 向文件传输助手完成一次真实文本发送验收。它现可通过 `./wx setup --native-root DIR` 接入原生文本工具，使用 `./wx send` 和 `./wx job`；默认未配置时只开放读取。详见 [实验说明](../experimental/native_send/README.md)。GUI 工具不是原生发送的替代证明。
 
 已有第三方旧版本 Hook 的对象布局与所测 build 不同；更新地址并不足以证明 ABI 兼容。其他版本、群聊、媒体和真实批量发送仍待单独验证。
+
+## 自动语音文字
+
+消息读取和增量接收自动附加 `voiceTranscript`（文本、状态、来源、缓存标记），优先读取微信已保存文本；缺失时由项目本地 SenseVoice 自动转写。首次按固定 SHA-256 准备约 205 MB 运行时/模型/FFmpeg，模型缓存为每位本机用户共享，转写缓存按账号与会话隔离且仅当前用户可读。没有音频或识别失败返回 unavailable，不交给智能体另写识别脚本。详见根目录 README 的“语音消息直接读取文本”。

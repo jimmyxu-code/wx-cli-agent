@@ -78,7 +78,9 @@ impl MediaBridge {
     pub fn resolve(&mut self, msg: &Message, talker: &str) -> Vec<MediaAsset> {
         match &msg.content {
             MessageContent::Image { md5: Some(md5) } => self.resolve_image(md5, talker),
-            MessageContent::Voice => self.resolve_voice(msg.server_id),
+            MessageContent::Voice | MessageContent::VoiceTranscript { .. } => {
+                self.resolve_voice(msg.server_id)
+            }
             MessageContent::Video { md5: Some(md5) } => self.resolve_video(md5, msg.create_time),
             MessageContent::File {
                 md5: Some(md5),

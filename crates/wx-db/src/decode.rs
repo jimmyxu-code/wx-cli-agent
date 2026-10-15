@@ -266,7 +266,14 @@ pub(crate) fn parse_content(
         MSG_TYPE_IMAGE => MessageContent::Image {
             md5: packed.and_then(|p| p.image_md5.clone()),
         },
-        MSG_TYPE_VOICE => MessageContent::Voice,
+        MSG_TYPE_VOICE => crate::xml_extract::extract_voice_transcript(content)
+            .or_else(|| {
+                compress_content
+                    .and_then(|blob| decode_content(blob, None).ok())
+                    .and_then(|xml| crate::xml_extract::extract_voice_transcript(&xml))
+            })
+            .map(|text| MessageContent::VoiceTranscript { text })
+            .unwrap_or(MessageContent::Voice),
         MSG_TYPE_VIDEO => MessageContent::Video {
             md5: packed.and_then(|p| p.video_md5.clone()),
         },

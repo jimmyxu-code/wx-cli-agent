@@ -260,6 +260,8 @@ pub enum MessageContent {
     },
     /// Voice / audio message (content not decoded).
     Voice,
+    /// Voice message with text already saved by WeChat. No media credentials.
+    VoiceTranscript { text: String },
     /// Video message with an optional MD5 hash from packed info.
     Video {
         /// MD5 hash of the video, extracted from protobuf `packed_info_data`.

@@ -50,3 +50,9 @@ read with `wechat_read_merged_attachment` (automatic CDN fallback). Use
 item selectors are separate; inner source IDs are not independent group messages.
 CDN download uses the local client route cache and needs no GUI or screen setup.
 Only verified plaintext size+MD5 constitutes success; never print CDN credentials.
+
+Voice messages include automatic `voiceTranscript` text/status/source in history,
+incremental pulls, timeline and SSE batches. Prefer saved WeChat text; otherwise
+project-side local ASR runs once and caches it. Do not transcribe audio separately
+in the agent. Check unavailable/error explicitly. `voiceTranscription=wechat` or
+`off` skips automatic model setup. No audio uploads or ASR API credentials.
