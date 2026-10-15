@@ -2,7 +2,20 @@
 
 2026-10-11，在 Apple Silicon Mac 的微信 **4.1.13 / build 269602** 上，向账号自己的文件传输助手实际发送一条文本。参数经过 JSON 控制器和私密 Unix socket，调用微信原生任务接口；原生完成回调的错误类型、错误码和 BaseResponse Ret 均为 0，用户在手机独立确认收到。GUI 只用于用户登录，没有输入或点击发送。
 
-这是独立的实验后端。常规读取 CLI、MCP 工具和既有 `chatter.py` 适配器没有切换到它。任意联系人、群聊、图片/附件、长期服务及大批量真实发送尚未验收。
+这是独立的实验后端。现在可经项目根入口注册到 CLI/MCP，未配置时常规读取仍默认只读；既有 `chatter.py` 是另一种适配器。任意联系人、群聊、图片/附件、长期服务及大批量真实发送尚未验收。
+
+## 给智能体的简化入口
+
+准备好自己的私密、已授权试验目录后，在项目根运行：
+
+```sh
+./wx setup --native-root /absolute/private/.state/native-trial
+./wx call wechat_native_sender_status
+./wx send filehelper '准确正文' --authorized
+./wx job JOB_ID
+```
+
+入口自动管理时间戳、消息编号、精确提案摘要、一次性授权与后台任务，智能体不用手写这些记录。`--authorized` 必须对应真实用户对准确收件人与正文的指令；省略时只准备。准备不启动微信、不发送，`setup` 不创建或改签微信副本。只复用下述已准备条件，未知结果不重放。已有兼容适配库可传 `--native-library FILE`，需要第二屏放置的宿主可传 `--window-command PATH`。
 
 ## 已实现
 
@@ -38,7 +51,7 @@ codesign --force --sign - .state/libwxnative413.dylib
 
 运行控制器还需要已核验的私密调试副本目录。该目录包含 `WeChat-trial.disabled`、签名计划、原版完整性摘要和签名记录，权限为 0700，记录文件为 0600。`metadata_trial.py` 和 `isolated_attach_trial.py` 只复用已准备的副本，不替你生成授权或修改原版。
 
-所测临时副本经过重签，具有调试权限；临时主程序移除 App Sandbox 并关闭 Library Validation，其余配置与签名计划逐项校验。原版签名与 SIP 保留。临时副本只在实验期间运行，结束后禁用。准备副本的相关脚本见仓库的 `agent_bridge/backends/receive/debug_copy_source`；准备记录的 schema 仍需与本实验的 preflight 对齐，不是下载即用的安装器。
+所测临时副本经过重签，具有调试权限；临时主程序移除 App Sandbox 并关闭 Library Validation，其余配置与签名计划逐项校验。原版签名与 SIP 保留。临时副本只在实验期间运行，结束后禁用。准备副本的相关脚本见仓库的 `agent_bridge/backends/receive/debug_copy_source`；准备记录的 schema 仍需与本实验的 preflight 对齐。短入口会检查记录并报告缺项，不会把缺少副本准备的机器宣称为可以发信。
 
 ## 结构化调用
 

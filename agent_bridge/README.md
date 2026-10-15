@@ -1,6 +1,17 @@
 # 本地 Agent 桥接层
 
-从仓库根目录运行 `sh agent_bridge/build-agent.sh`。常规使用请加 `--read-only`，例如 `agent_bridge/bin/wx-cli bridge --read-only mcp`。数据读取不依赖 GUI 助手。
+从仓库根目录运行 `./wx setup`、`./wx status`、`./wx tools`。发行包已有运行时；源码入口下载固定、校验过的 macOS arm64 二进制。需要源码编译时用 `./wx setup --build`。默认读取不依赖 GUI 助手，MCP 入口为 `./wx mcp`，JSON 配置由 `./wx config` 生成。旧 `bridge --read-only` 接口保留兼容。
+
+## 合并记录原件下载
+
+`./wx call wechat_list_merged_attachments JSON` 定位外层与内部文件，
+`wechat_read_merged_attachment` 默认自动补齐缺失原件，
+`wechat_download_merged_attachment` 强制网络下载并跳过已有文件。
+返回 `status=success`、`originalFileObtained=true`、大小/MD5 均 verified 才成功；
+强制下载还需 `networkDownloadPerformed=true`。缓存或鉴权失败才需确认原版微信登录联网。
+无需 GUI、分屏、SpaceO 或原生发送实验。后端模块见
+`backends/receive/cdn_download.py`，当前支持 C2C filetype=5 的合并记录文件。
+下载引用、auth key 和 AES 参数不回显、不入发布包。
 
 ## 临时副本取钥实验
 
@@ -22,6 +33,6 @@ python3 agent_bridge/backends/receive/debug_copy_source/bootstrap_keys.py --help
 
 ## 原生发送研究状态
 
-当前仅包含结构化后端适配器和合成测试。真实微信发送尚未通过验证，GUI 工具也不是原生发送的替代证明。默认只读模式不会暴露发送工具。
+独立原生后端已在 4.1.13/build 269602 向文件传输助手完成一次真实文本发送验收。它现可通过 `./wx setup --native-root DIR` 接入原生文本工具，使用 `./wx send` 和 `./wx job`；默认未配置时只开放读取。详见 [实验说明](../experimental/native_send/README.md)。GUI 工具不是原生发送的替代证明。
 
-已有第三方旧版本 Hook 的对象布局与所测 build 不同；更新地址并不足以证明 ABI 兼容。目前需要继续验证任务对象、序列化调用、线程及回调生命周期。当前版本不能用于批量消息发送。
+已有第三方旧版本 Hook 的对象布局与所测 build 不同；更新地址并不足以证明 ABI 兼容。其他版本、群聊、媒体和真实批量发送仍待单独验证。

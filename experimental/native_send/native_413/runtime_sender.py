@@ -50,8 +50,8 @@ def claim_once(path,proposal):
             'state':'enqueue_attempt_claimed','automatic_retry_allowed':False},stream)
         stream.flush();os.fsync(stream.fileno())
 
-def execute(root,library,proposal_path,approval_path,claim_path,seconds=110,report_name='native-self-send-result.json'):
-    if not re.fullmatch(r'native-self-send-result(?:-\d{2})?\.json',report_name):raise Guard('exact_private_report_name_required')
+def execute(root,library,proposal_path,approval_path,claim_path,seconds=110,report_name='native-self-send-result.json',place_window=None):
+    if not re.fullmatch(r'(?:native-self-send-result(?:-\d{2})?|native-agent-send-result-[0-9a-f]{32})\.json',report_name):raise Guard('exact_private_report_name_required')
     if (root/report_name).exists():raise Guard('preserve_existing_trial_report')
     proposal=load_approved_proposal(proposal_path,approval_path)
     if claim_path.exists():raise Guard('one_shot_already_claimed_no_retry')
@@ -73,6 +73,7 @@ def execute(root,library,proposal_path,approval_path,claim_path,seconds=110,repo
         time.sleep(2)
         if child.poll() is not None:raise Guard('temporary_child_exited')
         if child.pid not in trial.exact_processes_under(app):raise Guard('exact_child_required')
+        if place_window is not None:place_window(child.pid)
         stage='attach_exact_child';lldb.SBDebugger.Initialize();debugger=lldb.SBDebugger.Create()
         debugger.SkipLLDBInitFiles(True);debugger.SkipAppInitFiles(True);debugger.SetAsync(True)
         target=debugger.CreateTarget(str(main));listener=lldb.SBListener('native-one-shot-self-send')
@@ -137,6 +138,7 @@ def execute(root,library,proposal_path,approval_path,claim_path,seconds=110,repo
                 print(json.dumps({'type':'native_login_needed','enqueueCalled':False,'nativeCurrentAccountPresent':False}),flush=True)
                 consecutive=0
                 while time.monotonic()<deadline-35:
+                    if place_window is not None:place_window(child.pid)
                     event=trial.process_event(listener,process,lldb,timeout=0)
                     if event==lldb.eStateStopped:raise Guard('unexpected_stop_before_login')
                     if event==lldb.eStateExited:raise Guard('temporary_child_exited')
@@ -147,6 +149,7 @@ def execute(root,library,proposal_path,approval_path,claim_path,seconds=110,repo
             if not result['nativeCurrentAccountPresent']:raise Guard('native_account_not_ready_login_required')
             print(json.dumps({'type':'native_current_account_present','enqueueCalled':False}),flush=True)
             stage='prepare_approved_message'
+            if place_window is not None:place_window(child.pid)
             handle=json_command(client,{'op':'prepare','recipient':proposal['recipient'],'text':proposal['text'],
                 'timestamp':proposal['timestamp'],'client_message_id':proposal['client_message_id']})['handle']
             fresh=load_approved_proposal(proposal_path,approval_path)

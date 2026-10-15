@@ -23,6 +23,7 @@ jobs:
           "$wx_native_fixture_dir/test-core"
           xcrun clang++ -std=c++17 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer test_rpc_fixture.cpp -o "$wx_native_fixture_dir/test-rpc"
           WX_NATIVE_RPC_FIXTURE="$wx_native_fixture_dir/test-rpc" python3 test_rpc_client.py
+          PYTHONPATH="$(xcrun lldb -P)" /usr/bin/python3 -m unittest discover -s . -p 'test_sender_guard.py'
   bridge:
     runs-on: macos-latest
     steps:

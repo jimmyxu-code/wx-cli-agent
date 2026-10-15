@@ -16,6 +16,7 @@ STATE = ROOT / '.state'
 WX = os.environ.get('WX_CLI_BINARY', str(ROOT / 'bin/wx-cli'))
 NATIVE = os.environ.get('WECHAT_NATIVE_BINARY', str(ROOT / 'native/WeChatBridge.app/Contents/MacOS/wechat-native'))
 READ_ONLY_MODE = os.environ.get('WX_BRIDGE_READ_ONLY') == '1'
+NATIVE_SEND_MODE = False
 
 
 class BridgeError(Exception):
@@ -305,6 +306,13 @@ def service_read(name,args):
         paging['nextOffset']=paging.get('offset',0)+paging.get('returned',0) if paging.get('has_more') else None
         return result
     except service.ServiceError as error:
+        if name == 'wechat_read_media' and error.code == 'local_service_http_415':
+            try:
+                _, parent = merged_parent({'contact': args.get('contact'), 'account': args.get('account'), 'parentServerId': args.get('serverId')})
+                if 'MergedMessages' in parent.get('content', {}):
+                    raise BridgeError('merged_attachment_selector_required', 'The outer message is a merged record. Use wechat_list_merged_attachments then wechat_read_merged_attachment, or supply mergedItemPath to wechat_read_media.')
+            except BridgeError as lookup_error:
+                if lookup_error.code == 'merged_attachment_selector_required':raise
         raise BridgeError(error.code,'Local WeChat service read failed; private details withheld.')
 
 
@@ -358,11 +366,75 @@ def sender_backend():
         raise BridgeError('invalid_sender_config', 'Invalid local native sender configuration; private details withheld.')
 
 
+def merged_parent(args):
+    contact = text(args.get('contact'), 'contact')
+    server_id, sort_seq = args.get('parentServerId'), args.get('parentSortSeq')
+    if (server_id is None) == (sort_seq is None):
+        raise BridgeError('merged_parent_selector_required', 'Choose exactly one parentServerId or parentSortSeq; inner IDs are not parent message IDs.')
+    query = {'contact': contact, 'context': 1, 'limit': 3}
+    if args.get('account') is not None:query['account'] = args['account']
+    if server_id is not None:
+        if isinstance(server_id, str) and re.fullmatch('[0-9]{1,19}', server_id):server_id = int(server_id)
+        server_id = integer_arg(server_id, 'parentServerId', 1)
+        query['aroundServerId'] = server_id
+    else:
+        sort_seq = integer_arg(sort_seq, 'parentSortSeq', 1)
+        query['aroundSortSeq'] = sort_seq
+    data = paged_query('wechat_read_messages', query)
+    matches = [m for m in data.get('items', []) if m.get('server_id') == server_id] if server_id is not None else [m for m in data.get('items', []) if m.get('sort_seq') == sort_seq]
+    if len(matches) != 1:
+        raise BridgeError('merged_parent_not_found_or_ambiguous', 'The exact parent message was not uniquely found in this conversation.')
+    return contact, matches[0]
+
+
+def merged_attachment(name, args):
+    from backends.receive import merged_attachments as merged
+    try:
+        contact, message = merged_parent(args)
+        items = merged.file_items(message)
+        if name == 'wechat_list_merged_attachments':
+            names = args.get('fileNames')
+            if names is not None:
+                if not isinstance(names, list) or not names or len(names) > 100 or any(not isinstance(n, str) for n in names):
+                    raise BridgeError('invalid_argument', 'fileNames must be a nonempty array of exact file names.')
+                items = [item for item in items if item['fileName'] in names]
+            return {'parent': merged.parent_identity(message, contact), 'items': items, 'originalFilesObtained': False,
+                    'backend': 'merged_record_xml_metadata', 'innerIdsAreParentConversationMessageIds': False}
+        item = merged.select(items, args.get('itemPath'), args.get('dataId'))
+        scoped = account_args(args.get('account'))
+        account_root = next(p for p in accounts().values() if p.name == scoped[-1])
+        media = private_state() / 'media'
+        media.mkdir(mode=0o700, exist_ok=True)
+        allow_download = args.get('download', True)
+        if type(allow_download) is not bool:
+            raise BridgeError('invalid_argument', 'download must be a boolean.')
+        return merged.acquire(account_root, media, message, contact, item,
+                              allow_download=allow_download,
+                              force_download=name == 'wechat_download_merged_attachment')
+    except merged.AttachmentError as error:
+        raise BridgeError(error.code, 'Merged-record file lookup failed; CDN credentials and private details withheld.')
+
+
 def call(name, args):
     if not isinstance(args, dict):
         raise BridgeError('invalid_argument', 'Arguments must be an object.')
     if READ_ONLY_MODE and name not in {t['name'] for t in TOOLS if t['annotations']['readOnlyHint']}:
         raise BridgeError('read_only_mode','This server exposes only WeChat reading tools.')
+    if NATIVE_SEND_MODE and name not in {t['name'] for t in available_tools()}:
+        raise BridgeError('native_send_mode', 'This server exposes database reads and configured native text tools.')
+    if name in ('wechat_list_merged_attachments', 'wechat_read_merged_attachment', 'wechat_download_merged_attachment'):
+        return merged_attachment(name, args)
+    if name == 'wechat_read_media' and (args.get('mergedItemPath') is not None or args.get('mergedDataId') is not None):
+        return merged_attachment('wechat_read_merged_attachment', {'contact': args.get('contact'), 'account': args.get('account'),
+            'parentServerId': args.get('serverId'), 'itemPath': args.get('mergedItemPath'), 'dataId': args.get('mergedDataId')})
+    if name in ('wechat_prepare_native_text', 'wechat_submit_native_text', 'wechat_native_text_job'):
+        from backends.send.native_413 import agent_sender as sender
+        try:
+            if name == 'wechat_prepare_native_text':return sender.prepare(args.get('recipientId'), args.get('message'))
+            if name == 'wechat_submit_native_text':return sender.submit(args.get('draftId'), args.get('userAuthorized'))
+            return sender.job_status(args.get('jobId'))
+        except sender.SenderError as error:
+            raise BridgeError(error.code, 'Native text sender refused; check sender status. No automatic retry.')
     if name == 'wechat_list_files':
         return list_files(args)
     if name == 'wechat_read_file':return read_file(args)
@@ -415,10 +487,14 @@ def call(name, args):
                 'databaseKeyFileExists': key_path.is_file(),
                 'history': {'backend': 'wx_cli_database', 'requiresValidatedDatabaseKey': True, 'verifiedReadable': verified.get('history', False)},
                 'localData':verified.get('localData',{'verified':False}),
+                'mergedAttachments': {'backend':'merged_record_local_or_cdn_original','supported':True,'verifiesSizeAndMd5':True,
+                                      'automaticRemoteDownload':True,'requiresClientDownloadWhenMissing':False,
+                                      'requiresClientCdnRouteCache':True,'requiresGui':False,
+                                      'forceDownloadTool':'wechat_download_merged_attachment'},
                 'agentAccess':{'readOnlyMode':READ_ONLY_MODE,'mcp':'stdio','cli':True},
                 'incrementalReceive': {'backend': 'wx_cli_database', 'newRowVerified': verified.get('newRow', False), 'completeMessageStream': False},
                 'sessionWatch': {'backend': 'wx_cli_database_session_monitor', 'completeMessageStream': False},
-                'personalNativeSend': {'ready': False, 'reason': 'No locally verified native sender for this WeChat build.'},
+                'personalNativeSend': native_text_status(),
                 'visibleRead': {'backend': 'macos_accessibility_or_gui_ocr', 'completeHistory': False},
                 'note': 'Installed interfaces and a key file do not prove successful decryption or delivery.'}
     if name == 'wechat_watch_sessions':
@@ -455,6 +531,7 @@ def call(name, args):
         result['cursor'] = token
         return result
     if name == 'wechat_native_sender_status':
+        if NATIVE_SEND_MODE or (STATE / 'native-agent-sender.json').is_file() or not (STATE / 'native-sender.json').is_file():return native_text_status()
         from backends.send.chatter import SendError
         try:
             return sender_backend().capabilities(probe=args.get('probe', False) is True)
@@ -519,7 +596,12 @@ def call(name, args):
 def tool(name, description, properties=None, required=None, read_only=True):
     return {'name': name, 'description': description,
             'inputSchema': {'type': 'object', 'properties': properties or {}, 'required': required or [], 'additionalProperties': False},
-            'annotations': {'readOnlyHint': read_only, 'openWorldHint': name == 'wechat_send_message'}}
+            'annotations': {'readOnlyHint': read_only, 'openWorldHint': name in ('wechat_send_message', 'wechat_submit_native_text', 'wechat_read_media', 'wechat_read_merged_attachment', 'wechat_download_merged_attachment')}}
+
+
+def native_text_status():
+    from backends.send.native_413 import agent_sender
+    return agent_sender.status()
 
 
 CONTACT = {'type': 'string', 'minLength': 1, 'maxLength': 200}
@@ -528,6 +610,9 @@ OFFSET = {'type':'integer','minimum':0,'default':0}
 PAGE = {'account':CONTACT,'limit':LIMIT,'offset':OFFSET}
 ORDER = {'type':'string','enum':['asc','desc'],'default':'desc'}
 SHOW_HIDDEN = {'type':'boolean','default':False}
+MERGED_PATH = {'type':'array','minItems':1,'maxItems':9,'items':{'type':'integer','minimum':0,'maximum':2047}}
+MERGED_PARENT = {'account':CONTACT,'contact':CONTACT,'parentSortSeq':{'type':'integer','minimum':1,'maximum':2**63-1},
+    'parentServerId':{'oneOf':[{'type':'string','pattern':'^[0-9]{1,19}$'},{'type':'integer','minimum':1,'maximum':2**63-1}]}}
 TOOLS = [
     tool('wechat_doctor', 'Check local WeChat, Accessibility and database prerequisites; does not grant permissions.'),
     tool('wechat_key_preflight', 'Read-only key-path and system preflight. Never signs, attaches, reads key contents or changes SIP.'),
@@ -538,7 +623,10 @@ TOOLS = [
     tool('wechat_read_messages', 'Read complete paginated history, including structured non-text messages. Supports time/type filters and context anchors. For all history use asc and follow paging.nextOffset.', {**PAGE,'contact':CONTACT,'order':ORDER,'showHidden':SHOW_HIDDEN,'since':OFFSET,'until':OFFSET,'type':CONTACT,'aroundSortSeq':OFFSET,'aroundServerId':OFFSET,'context':LIMIT}, ['contact']),
     tool('wechat_search', 'Search across local conversations. Native uses the WeChat word index; scan checks decoded bodies for a literal substring, including numbers omitted by the index. Follow nextOffset for all hits.', {**PAGE,'keyword':CONTACT,'mode':{'type':'string','enum':['native','scan'],'default':'native'}}, ['keyword']),
     tool('wechat_timeline','Read a time-bounded timeline across all local conversations using the original loopback API. Follow nextOffset for every page.',{**PAGE,'since':OFFSET,'until':OFFSET,'order':ORDER,'showHidden':SHOW_HIDDEN,'type':CONTACT},['since','until']),
-    tool('wechat_read_media','Read original local image/voice/video/file content by exact conversation and message server ID. Returns a private exported file, MIME and image quality; unavailable local assets are explicit errors.',{'account':CONTACT,'contact':CONTACT,'serverId':OFFSET,'format':{'type':'string','enum':['ogg','mp3'],'default':'ogg'}},['contact','serverId']),
+    tool('wechat_read_media','Read original local media by exact conversation and outer message server ID. Merged-record files require mergedItemPath or mergedDataId; inner original IDs must not be used as independent messages in this group.',{'account':CONTACT,'contact':CONTACT,'serverId':OFFSET,'format':{'type':'string','enum':['ogg','mp3'],'default':'ogg'},'mergedItemPath':MERGED_PATH,'mergedDataId':CONTACT},['contact','serverId']),
+    tool('wechat_list_merged_attachments','List safe file metadata within one exact merged record. Choose one parentSortSeq or parentServerId (use decimal strings for 64-bit IDs), optionally filter exact fileNames. No CDN keys/URLs; no claim that file bytes were obtained.',{**MERGED_PARENT,'fileNames':{'type':'array','items':CONTACT,'minItems':1,'maxItems':100}},['contact']),
+    tool('wechat_read_merged_attachment','Get an original merged-record file: locate locally, otherwise download and AES-decrypt via the client CDN cache, then verify exact size and MD5. Choose one parentSortSeq/parentServerId and one itemPath/dataId. Set download=false for local-only reads. No GUI clicks or message sends.',{**MERGED_PARENT,'itemPath':MERGED_PATH,'dataId':CONTACT,'download':{'type':'boolean','default':True}},['contact']),
+    tool('wechat_download_merged_attachment','Always download a fresh original merged-record file from WeChat CDN, AES-decrypt and verify exact size and MD5. Bypasses all local file copies. Choose one parentSortSeq/parentServerId and one itemPath/dataId. Requires an existing client CDN cache, no GUI or message sends.',{**MERGED_PARENT,'itemPath':MERGED_PATH,'dataId':CONTACT},['contact']),
     tool('wechat_read_events','Read a bounded interval of original local SSE events, including message batches. Reconnect gaps require history/timeline recovery; no gap-free claim.',{'account':CONTACT,'seconds':{'type':'integer','minimum':1,'maximum':30,'default':10}}),
     tool('wechat_databases','List every refreshed local WeChat database, including favorites, SNS, media and business-message stores.',{'account':CONTACT}),
     tool('wechat_database_tables','Inspect tables, columns, keys and schema of a local WeChat database.',{'account':CONTACT,'database':CONTACT},['database']),
@@ -550,7 +638,10 @@ TOOLS = [
     tool('wechat_watch_sessions', 'Watch database session changes for a bounded interval. Requires a key; latest previews are not a complete new-message stream.', {'account': CONTACT, 'seconds': {'type': 'integer', 'minimum': 1, 'maximum': 30, 'default': 10}}),
     tool('wechat_receive_start', 'Create a database message cursor from now for one conversation. Requires a validated key; does not read old messages as new.', {'contact': CONTACT, 'account': CONTACT}, ['contact']),
     tool('wechat_receive_pull', 'Pull actual database message rows after a bound cursor. Save returned cursor only after consuming the batch; not guaranteed for late lower-sequence inserts.', {'contact': CONTACT, 'account': CONTACT, 'cursor': {'type': 'string'}, 'limit': LIMIT}, ['contact', 'cursor']),
-    tool('wechat_native_sender_status', 'Report configured native Hook backend prerequisites. Optional loopback GET route probe never sends and does not prove runtime readiness.', {'probe': {'type': 'boolean', 'default': False}}),
+    tool('wechat_native_sender_status', 'Check native sender configuration/build/login prerequisites without sending or launching WeChat. Optional probe only applies to a configured HTTP adapter.', {'probe': {'type': 'boolean', 'default': False}}),
+    tool('wechat_prepare_native_text', 'Prepare exact File Helper text as private JSON, without launching WeChat or sending.', {'recipientId': {'type': 'string', 'enum': ['filehelper']}, 'message': {'type': 'string', 'minLength': 1, 'maxLength': 16384}}, ['recipientId', 'message'], False),
+    tool('wechat_submit_native_text', 'Submit a prepared text once. userAuthorized attests an explicit human request for the exact recipient/text. Returns a job, not delivery. Requires compatible native setup, original WeChat quit, and temporary-client login. Never replay uncertainty.', {'draftId': {'type': 'string', 'pattern': '^[0-9a-f]{32}$'}, 'userAuthorized': {'type': 'boolean', 'const': True}}, ['draftId', 'userAuthorized'], False),
+    tool('wechat_native_text_job', 'Read native job progress/result without retrying. Login, queued, acknowledgement and recipient receipt are separate states.', {'jobId': {'type': 'string', 'pattern': '^[0-9a-f]{32}$'}}, ['jobId']),
     tool('wechat_prepare_native_message', 'Prepare an approval ticket for an explicitly configured native backend. Does not touch the UI or send; requires an attested build and exact recipient ID.', {'recipientId': CONTACT, 'message': {'type': 'string', 'maxLength': 10000}}, ['recipientId', 'message'], False),
     tool('wechat_open_chat', 'Open an exact conversation through macOS Accessibility; never sends.', {'contact': CONTACT}, ['contact'], False),
     tool('wechat_read_visible', 'Read visible text from an exact conversation, changing the active UI. Not complete history.', {'contact': CONTACT}, ['contact'],False),
@@ -558,6 +649,12 @@ TOOLS = [
     tool('wechat_prepare_message', 'Put text in an exact conversation as an unsent draft. Requires local review before sending.', {'contact': CONTACT, 'message': {'type': 'string', 'maxLength': 10000}}, ['contact', 'message'], False),
     tool('wechat_send_message', 'Send an exact previously reviewed draft once. Never use without specific human recipient/text authorization.', {'draftId': {'type': 'string'}, 'approvalToken': {'type': 'string'}}, ['draftId', 'approvalToken'], False),
 ]
+
+
+def available_tools():
+    return [t for t in TOOLS if (not READ_ONLY_MODE or t['annotations']['readOnlyHint']) and
+            (not NATIVE_SEND_MODE or t['annotations']['readOnlyHint'] or t['name'] in
+             ('wechat_prepare_native_text', 'wechat_submit_native_text'))]
 
 
 def handle_rpc(request):
@@ -571,7 +668,7 @@ def handle_rpc(request):
     if method == 'ping':
         result = {}
     elif method == 'tools/list':
-        result = {'tools': [t for t in TOOLS if not READ_ONLY_MODE or t['annotations']['readOnlyHint']]}
+        result = {'tools': available_tools()}
     elif method == 'tools/call':
         params = request.get('params', {})
         try:
@@ -587,14 +684,18 @@ def handle_rpc(request):
 
 
 def main():
-    global READ_ONLY_MODE
+    global READ_ONLY_MODE, NATIVE_SEND_MODE
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--read-only',action='store_true')
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--read-only',action='store_true')
+    mode.add_argument('--native-send',action='store_true')
     parser.add_argument('command', choices=['mcp', 'call', 'approve'])
     parser.add_argument('name', nargs='?')
     parser.add_argument('arguments', nargs='?', default='{}')
     args = parser.parse_args()
     READ_ONLY_MODE = READ_ONLY_MODE or args.read_only
+    NATIVE_SEND_MODE = args.native_send
+    if READ_ONLY_MODE and NATIVE_SEND_MODE:parser.error('Native sends cannot be enabled in a read-only environment.')
     if READ_ONLY_MODE and args.command=='approve':
         parser.error('Read-only mode cannot approve sends.')
     if args.command == 'mcp':

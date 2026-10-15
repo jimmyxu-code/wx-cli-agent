@@ -1,4 +1,7 @@
 /target
+/dist
+/.mcp.json
+/wx-agent.mcp.toml
 .DS_Store
 **/__pycache__/
 **/*.pyc
