@@ -3,14 +3,25 @@
 Use the portable `./wx` entry point from this repository or the extracted release.
 It works with any agent that can execute commands; MCP clients can use `./wx mcp`.
 
-1. Run `./wx status`. If the runtime is missing, run `./wx setup`. A release bundle
-   already contains it; a source checkout downloads the pinned SHA-256 verified
-   macOS arm64 runtime. `--build` uses Rust instead.
-2. Run `./wx tools` to discover available capabilities and JSON input schemas.
-   Use `./wx call TOOL JSON`, `./wx call TOOL -` (JSON stdin), or `--input-file`.
-   Convenience commands: `accounts`, `sessions`, `contacts`, `messages`, `search`.
-3. Generate the correct installation path with `./wx config`; use
-   `./wx config --format toml` for clients with TOML MCP configuration.
+1. Run `./wx connect --task read` once in a fresh agent session (or just `./wx`).
+   It installs a missing pinned runtime, selects a sole account, performs one real
+   bounded read and returns short executable command arrays. It never prints chat
+   bodies. Multiple accounts require `--account ALIAS`; errors name the exact blocker.
+2. Follow `nextCommands`, replacing placeholders with the user's requested inputs.
+   Use `--task search`, `download`, `send` or `mcp` for a focused workflow. Already
+   available MCP tools can be called directly; no second connection is required.
+3. Optional one-time `./wx connect --install-command` registers `~/.local/bin/wx`.
+   Then `wx connect` works from other directories when that directory is in PATH.
+   The launcher preserves arguments and refuses unrelated commands. Keep this
+   installation directory, or rerun registration after moving it.
+
+Query one schema with `./wx tools TOOL_NAME`; use `./wx tools --compact` only when
+choosing a capability. Full `./wx tools` remains available for schema consumers.
+Use `./wx call TOOL JSON`, stdin `-`, or `--input-file`; common commands are
+`accounts`, `sessions`, `contacts`, `messages`, `search`. CLI is usable immediately;
+MCP registration/restart is optional, including for older chats missing new tools.
+`./wx config` generates MCP JSON; `--format toml` generates TOML. The server command
+is `./wx mcp`.
 
 CLI stdout is JSON with `schemaVersion`, `ok`, and `data` or `error`. Errors include
 `nextActions`. MCP mode uses standard JSON-RPC. `config` outputs directly usable

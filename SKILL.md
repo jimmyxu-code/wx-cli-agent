@@ -10,18 +10,37 @@ agent-specific plugin or global installation is required.
 
 ## Start
 
-- `./wx status`: report platform, runtime, account access and key prerequisites.
-- `./wx setup`: use the bundled runtime or download the pinned, checksum-verified
-  macOS arm64 runtime. `--build` compiles from a source checkout with Rust.
-- `./wx tools`: discover currently available tools and their exact JSON schemas.
-- `./wx config`: generate MCP JSON with the current installation path;
-  `./wx config --format toml` generates TOML. MCP command is `./wx mcp`.
+If this agent already has working WeChat MCP tools, use them directly. Otherwise
+run `./wx connect --task read` once (bare `./wx` is equivalent). One command installs
+any missing pinned runtime, chooses a sole account, verifies one bounded read and
+returns short `nextCommands` argument arrays. Replace placeholders with requested
+inputs. It does not print chat bodies or perform GUI/security diagnostics.
 
-Discovery and configuration generation work before runtime installation. Setup
-never extracts keys, restarts WeChat, changes signatures or disables SIP. Reuse
-existing authorized keys. If missing, import a legitimate capture with
-`./wx setup --capture-file FILE --db-root DIR`; experimental capture preparation
-is documented separately in `agent_bridge/README.md`, and is not an automatic fix.
+Use `--task search`, `download`, `send` or `mcp` for task-specific examples; use
+`--account ALIAS` when multiple accounts exist. A blocked connection returns a
+nonzero exit code, the precise error and recovery; do not begin unrelated setup.
+
+Optional one-time `./wx connect --install-command` installs `~/.local/bin/wx`,
+preserving any unrelated command. With that directory in PATH, `wx` works from
+other directories. Keep the installation folder, or rerun registration after
+moving it. The installer does not edit shell profiles or global MCP settings.
+
+For unknown arguments, run `./wx tools TOOL_NAME`; `./wx tools --compact` gives a
+small capability catalog. Full `./wx tools` preserves the original schema output.
+Do not read every tool schema or re-check connection before every ordinary query.
+
+JSON CLI is immediately usable; registering/restarting MCP is optional. This is
+also the fallback when an old chat has not loaded newer tools. `./wx config`
+generates MCP JSON (or `--format toml`); the MCP command is `./wx mcp`, whose
+initial handshake also supplies concise usage instructions.
+
+`./wx status --verify` remains an explicit diagnostic. `./wx setup --build` builds
+from source; ordinary connection downloads only a pinned SHA-256-verified runtime
+if missing. Setup never extracts keys, restarts WeChat, changes its signature or
+disables SIP. Existing authorized keys remain a prerequisite; import an already
+authorized capture with `./wx setup --capture-file FILE --db-root DIR` if needed.
+Native experimental preparation is documented in `agent_bridge/README.md` and
+is not an automatic connection fix.
 
 ## Query
 

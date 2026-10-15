@@ -1,6 +1,6 @@
 # 本地 Agent 桥接层
 
-从仓库根目录运行 `./wx setup`、`./wx status`、`./wx tools`。发行包已有运行时；源码入口下载固定、校验过的 macOS arm64 二进制。需要源码编译时用 `./wx setup --build`。默认读取不依赖 GUI 助手，MCP 入口为 `./wx mcp`，JSON 配置由 `./wx config` 生成。旧 `bridge --read-only` 接口保留兼容。
+新智能体从仓库根目录运行 `./wx connect`，一次完成运行时补齐、真实读取验证和任务示例。例如 `--task download` 选择下载工作流，另支持 read、search、send、mcp；`--install-command` 可注册固定 `wx` 命令。原 `setup/status/tools` 接口保留兼容。发行包已有运行时；源码入口下载固定、校验过的 macOS arm64 二进制。需要源码编译时用 `./wx setup --build`。默认读取不依赖 GUI 助手，MCP 入口为 `./wx mcp`，JSON 配置由 `./wx config` 生成。旧 `bridge --read-only` 接口保留兼容。
 
 ## 合并记录原件下载
 

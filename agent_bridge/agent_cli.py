@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import platform
 import shutil
+import shlex
 import re
 import subprocess
 import sys
@@ -21,9 +22,10 @@ SETTINGS = ROOT / '.state/agent-settings.json'
 
 
 class AgentError(Exception):
-    def __init__(self, code, message, next_actions=None):
+    def __init__(self, code, message, next_actions=None, details=None):
         super().__init__(message)
         self.code, self.next_actions = code, next_actions or []
+        self.details = details
 
 
 class Parser(argparse.ArgumentParser):
@@ -56,9 +58,132 @@ def recovery(code):
 def error_output(error):
     code = getattr(error, 'code', 'internal_error')
     message = str(error) if isinstance(error, AgentError) else 'Agent entry point failed; private details withheld.'
-    print(json.dumps({'schemaVersion': 1, 'ok': False, 'error': {
+    result = {'schemaVersion': 1, 'ok': False, 'error': {
         'code': code, 'message': message, 'nextActions': getattr(error, 'next_actions', None) or recovery(code),
-        'automaticRetry': False}}, ensure_ascii=False))
+        'automaticRetry': False}}
+    if getattr(error, 'details', None) is not None:
+        result['error']['details'] = error.details
+    print(json.dumps(result, ensure_ascii=False))
+
+
+TASKS = {
+    'read': ('wechat_contacts', 'wechat_read_messages'),
+    'search': ('wechat_search',),
+    'download': ('wechat_list_merged_attachments', 'wechat_download_merged_attachment'),
+    'send': ('wechat_native_sender_status', 'wechat_prepare_native_text'),
+    'mcp': (),
+}
+
+
+def install_command(destination=None):
+    """Install an owned launcher, not a symlink whose $0 breaks repo discovery."""
+    path = Path(destination) if destination else Path.home() / '.local/bin/wx'
+    marker = '# wx-cli-agent managed launcher v1\n'
+    content = '#!/bin/sh\n' + marker + 'exec ' + shlex.quote(str(REPO / 'wx')) + ' "$@"\n'
+    if path.is_symlink():
+        raise AgentError('command_name_conflict', 'Existing wx symlink was preserved; use the repository entry point.')
+    if path.exists():
+        if (not path.is_file() or path.stat().st_uid != os.geteuid() or path.stat().st_size > 8192 or
+                not path.read_bytes().startswith(('#!/bin/sh\n' + marker).encode())):
+            raise AgentError('command_name_conflict', 'An unrelated wx command already exists; it was preserved.')
+    path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    fd, filename = tempfile.mkstemp(prefix='.wx-launcher-', dir=path.parent)
+    temporary = Path(filename)
+    try:
+        with os.fdopen(fd, 'w') as stream:
+            stream.write(content)
+        temporary.chmod(0o755)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    found = shutil.which('wx')
+    return {'path': str(path), 'onPath': bool(found and Path(found).resolve() == path.resolve())}
+
+
+def quickstart(task, account=None):
+    command = str(REPO / 'wx')
+    scope = ['--account', account] if account else []
+    commands = {
+        'read': [[command, 'contacts', 'NAME', '--limit', '10', *scope],
+                 [command, 'messages', 'CONTACT_ID', '--limit', '20', *scope]],
+        'search': [[command, 'search', 'KEYWORD', '--limit', '20', *scope]],
+        'download': [],
+        'send': [[command, 'call', 'wechat_native_sender_status', '{}'],
+                 [command, 'send', 'filehelper', 'EXACT_TEXT']],
+        'mcp': [[command, 'config'], [command, 'mcp']],
+    }
+    for name in TASKS['download']:
+        arguments = {'contact': 'CONTACT_ID', 'parentSortSeq': 1700000000000}
+        if account:
+            arguments['account'] = account
+        if name == 'wechat_download_merged_attachment':
+            arguments['itemPath'] = [0]
+        commands['download'].append([command, 'call', name, json.dumps(arguments, separators=(',', ':'))])
+    notes = {
+        'read': 'Replace NAME/CONTACT_ID with the requested name and exact returned ID. Follow paging.nextOffset for more history.',
+        'search': 'Replace KEYWORD. Literal body scanning is the default; follow paging.nextOffset for more results.',
+        'download': 'Replace CONTACT_ID, parentSortSeq and itemPath with the exact outer message and returned inner item. Inner original IDs are provenance. Success requires originalFileObtained, sizeVerified and md5Verified.',
+        'send': 'EXACT_TEXT is a placeholder; this example prepares only. Add --authorized only for an explicit human request for that exact recipient and text. Check status/job; never replay an uncertain submission.',
+        'mcp': 'JSON CLI works immediately. Configure MCP only if the client needs it; an older chat can use CLI without waiting for tool reload.',
+    }
+    return {'task': task, 'nextCommands': commands[task],
+            'schemaCommands': [[command, 'tools', name] for name in TASKS[task]],
+            'note': notes[task]}
+
+
+def connect(account=None, task='read', register=False):
+    """One bounded real check plus task guidance. No security/GUI preflight."""
+    value = bridge()
+    runtime = 'existing'
+    if not Path(value.WX).is_file():
+        runtime = install_runtime()
+        value = bridge()
+        if not Path(value.WX).is_file():
+            raise AgentError('cli_missing', 'The configured bridge cannot find its runtime.', ['./wx setup'])
+    result = {'ready': False, 'transport': 'json-cli', 'entrypoint': str(REPO / 'wx'),
+              'runtime': runtime, 'historyReadVerified': False}
+    if register:
+        result['installedCommand'] = install_command()
+    try:
+        found = invoke(value, 'wechat_accounts', {})['accounts']
+        aliases = [item['alias'] for item in found]
+        if account is not None and account not in aliases:
+            raise AgentError('unknown_account', 'Select an account alias returned by wx accounts.', ['./wx accounts'])
+        if account is None and len(aliases) > 1:
+            result['accounts'] = aliases
+            raise AgentError('account_selection_required', 'Multiple accounts exist. Re-run wx connect --account ALIAS.', ['./wx accounts', './wx connect --account ALIAS'])
+        if not aliases:
+            raise AgentError('wechat_account_missing', 'No saved WeChat account is available to this process.',
+                             ['Open WeChat and confirm a local login; retry wx connect.'])
+        account = account or aliases[0]
+        result['account'] = account
+        # Discard all message previews. Existence checks alone do not prove the
+        # key works; a single bounded read does, without exposing chat contents.
+        invoke(value, 'wechat_sessions', {'account': account, 'limit': 1})
+        result['historyReadVerified'] = True
+        if task == 'send':
+            state = invoke(value, 'wechat_native_sender_status', {})
+            result['nativeTextSender'] = state
+            if not state.get('configured') or not state.get('readyToStart'):
+                raise AgentError('native_sender_not_ready_check_status', 'Native text sender prerequisites are not ready; no send was prepared.',
+                                 ['./wx call wechat_native_sender_status'])
+        result.update(ready=True, **quickstart(task, account))
+        result['mcpOptional'] = True
+        return result
+    except AgentError as error:
+        result.update(quickstart(task, account))
+        raise AgentError(error.code, str(error), error.next_actions or recovery(error.code), result) from None
+
+
+def mcp_instructions():
+    return ('Use the available WeChat tools directly; a second connection/setup is unnecessary. '
+            'Resolve exact IDs with wechat_contacts, then read with wechat_read_messages or search with wechat_search. '
+            'For merged files use wechat_list_merged_attachments then wechat_read_merged_attachment '
+            '(automatic download) or wechat_download_merged_attachment (fresh download). '
+            'If this chat lacks a newer tool, use JSON CLI immediately: ' +
+            shlex.quote(str(REPO / 'wx')) + ' connect --task read. Choose search, download or send as --task when needed. '
+            'That read-only connect check returns exact commands; do not wait for a client restart. '
+            'Text sending requires an explicit human instruction for the exact recipient and text; setup never authorizes a send.')
 
 
 def bridge():
@@ -347,12 +472,17 @@ def write_config(path, format_name='json', name='wx-cli-agent'):
 
 
 def parser():
-    result = Parser(prog='./wx', description='WeChat agent entry point. JSON stdout; MCP uses JSON-RPC. Start with ./wx status or ./wx tools.')
+    result = Parser(prog='./wx', description='WeChat agent entry point. Start with ./wx connect: one real read check and task-specific commands. JSON stdout; MCP is optional.')
     commands = result.add_subparsers(dest='command')
+    p = commands.add_parser('connect', help='One-step runtime setup, bounded read verification and task guidance')
+    p.add_argument('--task', choices=TASKS, default='read')
+    p.add_argument('--account', help='Choose an exact account alias when multiple accounts exist')
+    p.add_argument('--install-command', action='store_true', help='Also install the managed ~/.local/bin/wx launcher; never overwrite unrelated commands')
     p = commands.add_parser('status', help='Check readiness without reading message bodies')
     p.add_argument('--verify', action='store_true', help='Attempt one bounded read and report only success/failure')
     p = commands.add_parser('tools', help='Discover available tools and exact JSON input schemas')
     p.add_argument('name', nargs='?')
+    p.add_argument('--compact', action='store_true', help='Small catalog without schemas; query one exact name for its schema')
     p = commands.add_parser('call', help='Call any discovered tool using JSON, stdin (-), or an input file')
     p.add_argument('name')
     p.add_argument('arguments', nargs='?')
@@ -364,12 +494,13 @@ def parser():
     p.add_argument('--name', default='wx-cli-agent')
     p = commands.add_parser('setup', help='Install pinned runtime; never extracts keys, restarts WeChat, or changes SIP')
     p.add_argument('--build', action='store_true', help='Build Rust locally instead of downloading the pinned runtime')
+    p.add_argument('--install-command', action='store_true', help='Install the managed ~/.local/bin/wx command')
     p.add_argument('--capture-file', help='Import an already authorized key capture using HMAC validation')
     p.add_argument('--db-root', help='Exact db_storage directory for the authorized capture')
     p.add_argument('--bridge-script', help='Use another trusted local bridge, including a configured native sender')
     p.add_argument('--native-root', help='Register an already authorized private native trial directory; no WeChat launch')
     p.add_argument('--native-library', help='Reuse a compatible owned native library instead of building one')
-    p.add_argument('--window-command', help='Optional agent-screen executable to enforce second-screen placement')
+    p.add_argument('--window-command', help='Optional agent-screen helper for placement on multiple physical displays')
     commands.add_parser('accounts', help='List anonymous local account aliases')
     p = commands.add_parser('send', help='Send exact text through a configured native bridge')
     p.add_argument('recipient', help='Currently verified: filehelper')
@@ -395,6 +526,9 @@ def parser():
 def main(argv=None):
     try:
         args = parser().parse_args(argv)
+        if args.command in (None, 'connect'):
+            output(connect(getattr(args, 'account', None), getattr(args, 'task', 'read'), getattr(args, 'install_command', False)))
+            return 0
         if args.command == 'config':
             generated = write_config(args.output, args.format, args.name) if args.output else config(args.format, args.name)
             if args.format == 'toml':
@@ -429,11 +563,12 @@ def main(argv=None):
                     imported = True
                 except value.BridgeError as error:
                     raise AgentError(error.code, str(error), recovery(error.code)) from None
-            output({'runtime': method, 'keysImported': imported, 'mcpConfig': str(REPO / '.mcp.json'), 'status': status(value),
-                    'nextActions': ['./wx config', './wx tools', './wx status --verify']})
+            launcher = install_command() if args.install_command else None
+            output({'runtime': method, 'keysImported': imported, 'mcpConfig': str(REPO / '.mcp.json'), 'installedCommand': launcher,
+                    'status': status(value), 'nextActions': ['./wx connect']})
             return 0
         value = bridge()
-        if args.command is None or args.command == 'status':
+        if args.command == 'status':
             output(status(value, getattr(args, 'verify', False)))
         elif args.command == 'tools':
             available = tools(value)
@@ -441,6 +576,8 @@ def main(argv=None):
                 available = [t for t in available if t['name'] == args.name]
                 if not available:
                     raise AgentError('unknown_tool', 'No available tool has that name.', ['./wx tools'])
+            if args.compact:
+                available = [{'name': t['name'], 'summary': t['description'].split('. ')[0][:90]} for t in available]
             output({'tools': available, 'callSyntax': './wx call TOOL JSON', 'stdinSyntax': './wx call TOOL -'})
         elif args.command == 'mcp':
             for line in sys.stdin:
@@ -452,6 +589,8 @@ def main(argv=None):
                             {'type': 'text', 'text': json.dumps(invoke(value, params.get('name', ''), params.get('arguments', {})), ensure_ascii=False)}], 'isError': False}}
                     else:
                         response = value.handle_rpc(request)
+                        if response is not None and request.get('method') == 'initialize' and 'result' in response:
+                            response['result']['instructions'] = mcp_instructions()
                 except AgentError as error:
                     response = {'jsonrpc': '2.0', 'id': request.get('id'), 'result': {'content': [{'type': 'text', 'text': json.dumps({
                         'error': error.code, 'message': str(error), 'nextActions': error.next_actions or recovery(error.code)}, ensure_ascii=False)}], 'isError': True}}

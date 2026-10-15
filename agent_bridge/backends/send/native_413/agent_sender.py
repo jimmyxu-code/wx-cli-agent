@@ -82,6 +82,15 @@ def screen_call(command, *args):
         raise SenderError('agent_screen_unavailable') from None
 
 
+def requires_second_screen(screen):
+    screens = screen.get('screens')
+    if isinstance(screens, list) and len(screens) == 1:
+        return False
+    if screen.get('mode') == 'second_physical_screen' and screen.get('accessibility') is True:
+        return True
+    raise SenderError('screen_placement_unavailable')
+
+
 def status():
     try:
         value = config()
@@ -154,8 +163,7 @@ def submit(identifier, user_authorized):
     value = config()
     if value.get('windowCommand'):
         screen = screen_call(value['windowCommand'], 'prepare')
-        if screen.get('mode') != 'second_physical_screen' or screen.get('accessibility') is not True:
-            raise SenderError('native_launch_requires_spaceo_or_second_screen')
+        requires_second_screen(screen)
     try:
         fd = os.open(path / 'submitted.json', os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     except FileExistsError:
@@ -219,8 +227,12 @@ def worker(identifier):
                 save(path / 'state.json', progress)
                 return
             current = screen_call(value['windowCommand'], 'status', pid)
-            if current.get('mode') != 'second_physical_screen' or current.get('accessibility') is not True:
-                raise sender.Guard('second_screen_placement_required')
+            if not requires_second_screen(current):
+                progress = load(path / 'state.json')
+                progress['nativePid'] = pid
+                if progress.get('phase') == 'starting': progress['phase'] = 'native_process_started'
+                save(path / 'state.json', progress)
+                return
             target = next(s['bounds'] for s in current['screens'] if s['id'] == current['target_display_id'])
             for window in current.get('windows', []):
                 bounds = window['bounds']

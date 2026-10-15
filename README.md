@@ -2,21 +2,33 @@
 
 用于 macOS 微信的读取、合并记录原件下载 CLI 和 MCP 桥接层，基于 [pandorafuture/wx-cli](https://github.com/pandorafuture/wx-cli)。保留上游 Git 历史及 MIT 许可证，本分支补充账号解析、搜索和 Agent 接口。
 
-为有命令执行能力或 MCP 支持的智能体提供统一入口 **`./wx`**。不依赖 Codex、特定智能体插件或全局安装。所有工具可自行发现，普通查询默认 JSON，错误包含下一步操作。
+为有命令执行能力或 MCP 支持的智能体提供统一入口 **`./wx`**。不依赖 Codex、特定智能体插件或全局安装。`wx connect` 一步完成真实连接检查并返回任务示例；普通查询默认 JSON，错误包含下一步操作。
 
 常规发布接口提供**已验证的本地读取和合并记录原文件自动下载能力**。配置兼容的可信本机原生桥接后，相同入口可提供单条文本发送和任务查询。另附 [原生文本发送实验](experimental/native_send/README.md)：本机微信 4.1.13/build 269602 的文件传输助手文本已通过原生回包及手机接收验证。其他机器仍需要自己的兼容运行环境和私密副本准备，不能承诺解压即具备发信条件。这里不包含微信程序、账号数据库、聊天记录、捕获密钥或私有配置。
 
 最新 macOS arm64 发行包与校验文件见 [GitHub Releases](https://github.com/jimmyxu-code/wx-cli-agent/releases/latest)。
 
-## 给智能体的三步开始
+## 给新智能体的一步接入
 
 ```sh
-./wx setup                       # 发行包复用二进制；源码版下载固定版本并校验 SHA-256
-./wx status                      # 检查缺什么；默认不读消息正文
-./wx tools                       # 所有可用工具及准确 JSON schema
+./wx connect                     # 或直接 ./wx：自动补齐运行时，实际验证一次读取
+./wx connect --task download     # 按任务给出最短调用示例；也支持 read/search/send/mcp
 ```
 
-拿到发行包后解压，进入 `wx-cli-agent` 目录即可。源码克隆也用同样入口；默认不需要安装 Rust。`./wx setup --build` 可选择源码编译。`setup` 自动生成当前路径的 `.mcp.json`，不修改其他智能体的全局配置。
+返回 `ready=true`、`historyReadVerified=true` 和可直接执行的 `nextCommands` 参数数组。连接验证不输出聊天正文，不启动微信，也不进行 GUI、分屏或 SIP 诊断。多账号时明确返回选择提示，用 `--account ALIAS` 重试；密钥、权限等问题返回准确阻塞点，不让智能体盲目折腾其他配置。
+
+已加载的 MCP 工具可直接调用。JSON CLI 随时可用，旧聊天没有新工具时也无需等待 MCP 刷新或重启客户端。只在新智能体首次使用或实际遇到错误时接入，不需要每次查询前重复检查。
+
+可选的一次性固定命令安装：
+
+```sh
+./wx connect --install-command   # 注册 ~/.local/bin/wx，不覆盖其他程序
+wx connect --task search         # ~/.local/bin 在 PATH 中时，可从任何目录使用
+```
+
+固定入口保留中文、空格和参数边界；不会修改 shell 配置或全局 MCP 配置。保留当前安装目录；移动目录后重新运行注册即可。
+
+拿到发行包后解压，进入 `wx-cli-agent` 目录执行上面的命令。源码克隆也一样，默认无需 Rust。`./wx setup --build` 可选择源码编译；原 `setup/status/tools/config` 接口继续兼容。
 
 ```sh
 ./wx accounts
@@ -25,7 +37,8 @@
 ./wx messages filehelper --limit 20
 ./wx search '2026-10-13'           # 默认正文扫描，包含数字和整句
 ./wx call wechat_read_messages '{"contact":"filehelper","limit":20}'
-./wx tools wechat_read_messages   # 不记参数：查准确 schema
+./wx tools wechat_read_messages   # 只查看当前需要的准确 schema
+./wx tools --compact             # 简短功能目录；原 tools 完整输出仍保留
 ./wx call wechat_read_messages --input-file request.json
 ```
 
@@ -161,7 +174,7 @@ Python 测试使用合成数据库和模拟服务，不读取你的微信账号�
 
 ```sh
 python3 scripts/package-agent.py --binary agent_bridge/bin/wx-cli \
-  --version v0.7.4-agent.3 --output dist/wx-cli-agent-v0.7.4-agent.3-macos-arm64.tar.gz
+  --version v0.7.4-agent.4 --output dist/wx-cli-agent-v0.7.4-agent.4-macos-arm64.tar.gz
 ```
 
 打包器按源码允许列表收集文件，携带显式指定的开源 CLI 二进制，生成 SHA-256 文件；排除 `.state`、本机 MCP 配置、账号数据、密钥、缓存和微信程序。发行包可离线复用随包运行时；首次账号/密钥条件仍由 `status` 检查。若修改 Rust 功能，维护者应先 `./wx setup --build` 并更新固定运行时发布信息，避免源码入口下载旧功能版本。
