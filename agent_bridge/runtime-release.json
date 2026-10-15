@@ -1,9 +1,10 @@
 {
   "schemaVersion": 1,
   "darwin-arm64": {
-    "tag": "v0.7.4-agent.1",
-    "url": "https://github.com/jimmyxu-code/wx-cli-agent/releases/download/v0.7.4-agent.1/wx-cli-agent-v0.7.4-agent.1-macos-arm64.tar.gz",
-    "sha256": "aee3e820fe01b6cca7ca4283472a586983cf8bc6dcb6241eec635ba13daef378",
-    "binaryMember": "wx-cli-agent/agent_bridge/bin/wx-cli"
+    "tag": "v0.7.4-agent.5",
+    "url": "https://github.com/jimmyxu-code/wx-cli-agent/releases/download/v0.7.4-agent.5/wx-cli-runtime-v0.7.4-agent.5-macos-arm64.tar.gz",
+    "sha256": "b21da9f2c147d23ecfc1c9376529982382673b783fb6ca3ff2f51f77cddff46d",
+    "binaryMember": "wx-cli-runtime/wx-cli",
+    "sourceCommit": "5c80fe007d88cef2c9052e2a0a0f08c55a832f94"
   }
 }
